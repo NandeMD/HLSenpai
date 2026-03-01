@@ -41,7 +41,7 @@ Just clean, predictable output.
 
 | Layer | Tech |
 |-------|------|
-| GUI | `gpui-component` |
+| GUI | `iced` |
 | Core | Rust |
 | Video Engine | `rust-ffmpeg` |
 | Codec | libx264 |
