@@ -1,6 +1,9 @@
 use crate::app::{AppState, HLSenpai};
-use crate::ff_helpers::{PreviewVideo, validate_video_file};
+use crate::ff_helpers::{
+    PreviewVideo, extract_video_metadata, validate_video_file, video_metadata_markdown,
+};
 use iced::Task;
+use iced::widget::markdown;
 use iced_video_player::Video;
 use std::time::Duration;
 
@@ -13,6 +16,7 @@ pub(crate) enum Message {
     SeekRelease,
     EndOfStream,
     NewFrame,
+    MarkdownLinkClicked(markdown::Uri),
 }
 
 pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Message> {
@@ -29,6 +33,27 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
             app.video = match selection {
                 Some(path) => match validate_video_file(&path) {
                     Ok(()) => {
+                        let metadata = match extract_video_metadata(&path) {
+                            Ok(metadata) => metadata,
+                            Err(reason) => {
+                                let err_msg = format!(
+                                    "Could not read video metadata:\n{}\nReason: {}",
+                                    path.display(),
+                                    reason
+                                );
+                                let _ = rfd::MessageDialog::new()
+                                    .set_title("Metadata Read Failed")
+                                    .set_description(&err_msg)
+                                    .set_buttons(rfd::MessageButtons::Ok)
+                                    .show();
+                                eprintln!("{err_msg}");
+                                app.state = AppState::Initial;
+                                return Task::none();
+                            }
+                        };
+                        let metadata_markdown_content =
+                            markdown::Content::parse(&video_metadata_markdown(&metadata));
+
                         let video_url = match url::Url::from_file_path(&path) {
                             Ok(url) => url,
                             Err(()) => {
@@ -54,6 +79,8 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                                 Some(PreviewVideo {
                                     video,
                                     _path: path,
+                                    metadata,
+                                    metadata_markdown: metadata_markdown_content,
                                     position: 0.0,
                                     dragging: false,
                                 })
@@ -131,9 +158,14 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
             println!("End of stream reached");
         }
         Message::NewFrame => {
-            if let Some(video) = app.video.as_mut() && !video.dragging {
+            if let Some(video) = app.video.as_mut()
+                && !video.dragging
+            {
                 video.position = video.video.position().as_secs_f64();
             }
+        }
+        Message::MarkdownLinkClicked(uri) => {
+            println!("Markdown link clicked: {uri}");
         }
     }
 
