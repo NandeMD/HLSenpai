@@ -1,8 +1,8 @@
 use crate::app::{AudioCodec, EncodeRuntimeState, HLSenpai, HlsPlaylistType, VideoCodecLib};
 use crate::message::Message;
 use iced::widget::{
-    button, checkbox, column, container, markdown, pick_list, progress_bar, row, scrollable,
-    slider, stack, text, text_input,
+    button, checkbox, column, container, markdown, opaque, pick_list, progress_bar, row,
+    scrollable, slider, stack, text, text_input,
 };
 use iced::{Alignment, Background, Element, Length};
 use iced_video_player::VideoPlayer;
@@ -544,7 +544,7 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                     }
                 });
 
-                layered = stack![layered, popup_layer]
+                layered = stack![layered, opaque(popup_layer)]
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .into();
@@ -637,7 +637,7 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                     }
                 });
 
-                layered = stack![layered, log_popup_layer]
+                layered = stack![layered, opaque(log_popup_layer)]
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .into();
