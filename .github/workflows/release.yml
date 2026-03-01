@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.meta.outputs.release_version }}
+    steps:
+      - name: Compute release version
+        id: meta
+        run: echo "release_version=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            ffmpeg \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libavfilter-dev \
+            libavdevice-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav \
+            libasound2-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libudev-dev \
+            libgtk-3-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install ffmpeg gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix gstreamer)/lib/pkgconfig:$(brew --prefix gst-plugins-base)/lib/pkgconfig:$(brew --prefix ffmpeg)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+          git clone https://github.com/microsoft/vcpkg $vcpkgRoot
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          & "$vcpkgRoot\vcpkg.exe" install ffmpeg:x64-windows
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKGRS_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          choco install -y gstreamer gstreamer-devel
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          if (Test-Path $gstRoot) {
+            "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig;$env:PKG_CONFIG_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package artifact (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux) platform="linux-x86_64" ;;
+            macOS) platform="macos-${{ runner.arch }}" ;;
+          esac
+          archive="hlsenpai-${RELEASE_VERSION}-${platform}.tar.gz"
+          tar -czf "$archive" -C target/release hlsenpai
+          echo "ARCHIVE_NAME=$archive" >> "$GITHUB_ENV"
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $platform = "windows-${env:RUNNER_ARCH}"
+          $archive = "hlsenpai-$env:RELEASE_VERSION-$platform.zip"
+          Compress-Archive -Path "target/release/hlsenpai.exe" -DestinationPath $archive
+          "ARCHIVE_NAME=$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: ${{ env.ARCHIVE_NAME }}
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_version }}
+          name: ${{ needs.prepare.outputs.release_version }}
+          generate_release_notes: true
+          files: |
+            dist/*
