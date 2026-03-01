@@ -1,15 +1,17 @@
 use crate::config::{
-    AppAuthConfig, ConfigPaths, PersistedEncodePreset, load_auth_config, load_last_preset,
-    save_auth_config, save_last_preset,
+    AppAuthConfig, ConfigPaths, PersistedEncodePreset, PersistedUploadPrefs, load_auth_config,
+    load_last_preset, load_upload_prefs, save_auth_config, save_last_preset, save_upload_prefs,
 };
 use crate::ff_helpers::{PreviewVideo, VideoMetadata};
 use crate::message::*;
+use crate::upload::{UploadOverwriteMode, UploadProgress, UploadTargetKind, UploadWorkerEvent};
 use crate::views;
 
 use iced::widget::markdown;
 use iced::{Element, Subscription, Task, Theme};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
@@ -410,6 +412,7 @@ pub(crate) enum EncodeWorkerEvent {
     Finished {
         exit_code: Option<i32>,
         was_canceled: bool,
+        output_root: PathBuf,
     },
     SpawnError(String),
 }
@@ -434,6 +437,7 @@ pub(crate) struct EncodeRuntimeState {
     pub receiver: Receiver<EncodeWorkerEvent>,
     pub cancel_flag: Arc<AtomicBool>,
     pub duration_ms: Option<u64>,
+    pub output_root: Option<PathBuf>,
 }
 
 impl EncodeRuntimeState {
@@ -455,6 +459,7 @@ impl EncodeRuntimeState {
             receiver,
             cancel_flag,
             duration_ms,
+            output_root: None,
         }
     }
 
@@ -485,6 +490,110 @@ impl EncodeRuntimeState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadStatus {
+    Running,
+    Canceling,
+    Success,
+    Failed,
+    Canceled,
+}
+
+pub(crate) struct UploadRuntimeState {
+    pub status: UploadStatus,
+    pub started_at: Instant,
+    pub progress_percent: Option<f32>,
+    pub uploaded_files: usize,
+    pub skipped_files: usize,
+    pub failed_files: usize,
+    pub total_files: usize,
+    pub uploaded_bytes: u64,
+    pub total_bytes: u64,
+    pub log_lines: Vec<String>,
+    pub receiver: Receiver<UploadWorkerEvent>,
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+impl UploadRuntimeState {
+    const MAX_LOG_LINES: usize = 2_000;
+
+    pub(crate) fn new(receiver: Receiver<UploadWorkerEvent>, cancel_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            status: UploadStatus::Running,
+            started_at: Instant::now(),
+            progress_percent: None,
+            uploaded_files: 0,
+            skipped_files: 0,
+            failed_files: 0,
+            total_files: 0,
+            uploaded_bytes: 0,
+            total_bytes: 0,
+            log_lines: Vec::new(),
+            receiver,
+            cancel_flag,
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self.status, UploadStatus::Running | UploadStatus::Canceling)
+    }
+
+    pub(crate) fn can_cancel(&self) -> bool {
+        matches!(self.status, UploadStatus::Running | UploadStatus::Canceling)
+    }
+
+    pub(crate) fn append_log_line(&mut self, line: String) {
+        self.log_lines.push(line);
+        let overflow = self.log_lines.len().saturating_sub(Self::MAX_LOG_LINES);
+        if overflow > 0 {
+            self.log_lines.drain(0..overflow);
+        }
+    }
+
+    pub(crate) fn apply_progress(&mut self, progress: &UploadProgress) {
+        self.progress_percent = Some(progress.percent.clamp(0.0, 100.0));
+        self.uploaded_files = progress.uploaded_files;
+        self.skipped_files = progress.skipped_files;
+        self.failed_files = progress.failed_files;
+        self.total_files = progress.total_files;
+        self.uploaded_bytes = progress.uploaded_bytes;
+        self.total_bytes = progress.total_bytes;
+    }
+
+    pub(crate) fn status_label(&self) -> &'static str {
+        match self.status {
+            UploadStatus::Running => "Running",
+            UploadStatus::Canceling => "Canceling",
+            UploadStatus::Success => "Success",
+            UploadStatus::Failed => "Failed",
+            UploadStatus::Canceled => "Canceled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UploadFormState {
+    pub available_targets: Vec<UploadTargetKind>,
+    pub selected_target: Option<UploadTargetKind>,
+    pub bucket: String,
+    pub prefix: String,
+    pub overwrite_mode: UploadOverwriteMode,
+}
+
+impl UploadFormState {
+    pub(crate) fn is_ready(&self) -> bool {
+        self.selected_target.is_some() && !self.bucket.trim().is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AwsCredentialsFormState {
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: String,
+}
+
 pub(crate) struct HLSenpai {
     pub video: Option<PreviewVideo>,
     pub state: AppState,
@@ -492,9 +601,16 @@ pub(crate) struct HLSenpai {
     pub ffmpeg_script_popup: Option<markdown::Content>,
     pub encode_runtime: Option<EncodeRuntimeState>,
     pub show_encode_log_modal: bool,
+    pub show_upload_modal: bool,
+    pub show_upload_credentials_modal: bool,
+    pub upload_runtime: Option<UploadRuntimeState>,
+    pub upload_form: UploadFormState,
+    pub upload_credentials_form: AwsCredentialsFormState,
+    pub last_encode_output_root: Option<PathBuf>,
     pub config_paths: ConfigPaths,
-    pub _auth_config: AppAuthConfig,
+    pub auth_config: AppAuthConfig,
     pub last_preset: Option<PersistedEncodePreset>,
+    pub upload_prefs: PersistedUploadPrefs,
 }
 
 impl Default for HLSenpai {
@@ -533,6 +649,17 @@ impl HLSenpai {
             }
         };
 
+        let upload_prefs = match load_upload_prefs(&config_paths) {
+            Ok(prefs) => prefs,
+            Err(err) => {
+                eprintln!(
+                    "Could not load upload preferences: {}. Using defaults.",
+                    err
+                );
+                PersistedUploadPrefs::default()
+            }
+        };
+
         Self {
             video: None,
             state: AppState::Initial,
@@ -540,9 +667,35 @@ impl HLSenpai {
             ffmpeg_script_popup: None,
             encode_runtime: None,
             show_encode_log_modal: false,
+            show_upload_modal: false,
+            show_upload_credentials_modal: false,
+            upload_runtime: None,
+            upload_form: UploadFormState {
+                overwrite_mode: upload_prefs
+                    .last_overwrite_mode
+                    .as_deref()
+                    .map(UploadOverwriteMode::from_str)
+                    .unwrap_or_default(),
+                bucket: upload_prefs.last_bucket.clone().unwrap_or_default(),
+                prefix: upload_prefs.last_prefix.clone().unwrap_or_default(),
+                selected_target: upload_prefs
+                    .last_upload_provider
+                    .as_deref()
+                    .and_then(|value| {
+                        if value == "aws_s3" {
+                            Some(UploadTargetKind::AwsS3)
+                        } else {
+                            None
+                        }
+                    }),
+                ..UploadFormState::default()
+            },
+            upload_credentials_form: AwsCredentialsFormState::default(),
+            last_encode_output_root: None,
             config_paths,
-            _auth_config: auth_config,
+            auth_config,
             last_preset,
+            upload_prefs,
         }
     }
 
@@ -551,14 +704,31 @@ impl HLSenpai {
     }
 
     pub(crate) fn subscription(&self) -> Subscription<Message> {
-        if self
+        let encode_subscription = if self
             .encode_runtime
             .as_ref()
             .is_some_and(EncodeRuntimeState::is_running)
         {
-            iced::time::every(Duration::from_millis(200)).map(|_| Message::EncodePollTick)
+            Some(iced::time::every(Duration::from_millis(200)).map(|_| Message::EncodePollTick))
         } else {
-            Subscription::none()
+            None
+        };
+
+        let upload_subscription = if self
+            .upload_runtime
+            .as_ref()
+            .is_some_and(UploadRuntimeState::is_running)
+        {
+            Some(iced::time::every(Duration::from_millis(200)).map(|_| Message::UploadPollTick))
+        } else {
+            None
+        };
+
+        match (encode_subscription, upload_subscription) {
+            (Some(encode), Some(upload)) => Subscription::batch(vec![encode, upload]),
+            (Some(encode), None) => encode,
+            (None, Some(upload)) => upload,
+            (None, None) => Subscription::none(),
         }
     }
 
@@ -588,6 +758,30 @@ impl HLSenpai {
                 eprintln!("Could not save last encoding preset: {}", err);
             }
         }
+    }
+
+    pub(crate) fn persist_upload_prefs(&mut self) {
+        self.upload_prefs.last_upload_provider =
+            self.upload_form.selected_target.map(|target| match target {
+                UploadTargetKind::AwsS3 => "aws_s3".to_string(),
+            });
+        self.upload_prefs.last_overwrite_mode =
+            Some(self.upload_form.overwrite_mode.as_str().to_string());
+        self.upload_prefs.last_bucket = non_empty(&self.upload_form.bucket);
+        self.upload_prefs.last_prefix = non_empty(&self.upload_form.prefix);
+
+        if let Err(err) = save_upload_prefs(&self.config_paths, &self.upload_prefs) {
+            eprintln!("Could not save upload preferences: {}", err);
+        }
+    }
+}
+
+pub(crate) fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 

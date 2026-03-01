@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod ff_helpers;
 mod message;
+mod upload;
 mod views;
 
 pub fn run() -> iced::Result {

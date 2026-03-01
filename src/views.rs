@@ -1,5 +1,8 @@
-use crate::app::{AudioCodec, EncodeRuntimeState, HLSenpai, HlsPlaylistType, VideoCodecLib};
+use crate::app::{
+    AudioCodec, EncodeRuntimeState, EncodeStatus, HLSenpai, HlsPlaylistType, VideoCodecLib,
+};
 use crate::message::Message;
+use crate::upload::UploadOverwriteMode;
 use iced::widget::{
     button, checkbox, column, container, markdown, opaque, pick_list, progress_bar, row,
     scrollable, slider, stack, text, text_input,
@@ -489,6 +492,16 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
             .spacing(14)
             .align_y(Alignment::Center);
 
+            let can_upload = app
+                .encode_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.status == EncodeStatus::Success)
+                && app.last_encode_output_root.is_some();
+
+            if can_upload {
+                header = header.push(button("Upload to...").on_press(Message::UploadToPressed));
+            }
+
             if app.encode_runtime.is_some() && !app.show_encode_log_modal {
                 header =
                     header.push(button("Show Encode Log").on_press(Message::EncodeLogModalOpen));
@@ -662,6 +675,260 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                     .into();
             }
 
+            if app.show_upload_modal {
+                let target_picker = pick_list(
+                    app.upload_form.available_targets.as_slice(),
+                    app.upload_form.selected_target,
+                    Message::UploadTargetSelected,
+                )
+                .width(Length::Fill);
+
+                let overwrite_picker = pick_list(
+                    &UploadOverwriteMode::ALL[..],
+                    Some(app.upload_form.overwrite_mode),
+                    Message::UploadOverwriteModeSelected,
+                )
+                .width(Length::Fill);
+
+                let is_upload_running = app
+                    .upload_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.is_running());
+
+                let upload_button = if app.upload_form.is_ready() && !is_upload_running {
+                    button("Upload")
+                        .style(iced::widget::button::danger)
+                        .on_press(Message::UploadStartPressed)
+                } else {
+                    button("Upload").style(iced::widget::button::danger)
+                };
+
+                let credentials_button =
+                    button("Set Credentials").on_press(Message::UploadCredentialsPromptOpen);
+
+                let close_button = button("Close").on_press(Message::UploadModalClose);
+
+                let runtime = app.upload_runtime.as_ref();
+                let progress_value = runtime
+                    .and_then(|state| state.progress_percent)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 100.0);
+                let progress_label = runtime
+                    .and_then(|state| state.progress_percent)
+                    .map(|value| format!("{value:.1}%"))
+                    .unwrap_or_else(|| "Idle".to_string());
+                let status_label = runtime.map(|state| state.status_label()).unwrap_or("Ready");
+                let elapsed_label = runtime
+                    .map(|state| format_duration(state.started_at.elapsed()))
+                    .unwrap_or_else(|| "00:00".to_string());
+                let totals_label = if let Some(state) = runtime {
+                    format!(
+                        "Files: {}/{} | Skipped: {} | Failed: {}",
+                        state.uploaded_files,
+                        state.total_files,
+                        state.skipped_files,
+                        state.failed_files
+                    )
+                } else {
+                    "Files: 0/0 | Skipped: 0 | Failed: 0".to_string()
+                };
+                let bytes_label = if let Some(state) = runtime {
+                    format!(
+                        "Bytes: {} / {}",
+                        format_bytes(state.uploaded_bytes),
+                        format_bytes(state.total_bytes)
+                    )
+                } else {
+                    "Bytes: 0 B / 0 B".to_string()
+                };
+                let logs_text = if let Some(state) = runtime {
+                    if state.log_lines.is_empty() {
+                        "Waiting for upload output...".to_string()
+                    } else {
+                        state.log_lines.join("\n")
+                    }
+                } else {
+                    "Upload has not started yet.".to_string()
+                };
+
+                let cancel_button = if runtime.is_some_and(|state| state.can_cancel()) {
+                    button("Cancel Upload")
+                        .style(iced::widget::button::danger)
+                        .on_press(Message::UploadCancelPressed)
+                } else {
+                    button("Cancel Upload").style(iced::widget::button::danger)
+                };
+
+                let upload_modal_content = column![
+                    row![text("Upload").size(24).width(Length::Fill), close_button]
+                        .align_y(Alignment::Center),
+                    row![text("Target").width(Length::Fixed(220.0)), target_picker]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    row![
+                        text("S3 bucket").width(Length::Fixed(220.0)),
+                        text_input("my-bucket", &app.upload_form.bucket)
+                            .on_input(Message::UploadBucketChanged)
+                            .width(Length::Fill)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    row![
+                        text("S3 prefix").width(Length::Fixed(220.0)),
+                        text_input("vods/my-video", &app.upload_form.prefix)
+                            .on_input(Message::UploadPrefixChanged)
+                            .width(Length::Fill)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    row![
+                        text("Overwrite mode").width(Length::Fixed(220.0)),
+                        overwrite_picker
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    row![credentials_button, upload_button, cancel_button].spacing(10),
+                    text(format!("Status: {status_label}")).size(18),
+                    row![
+                        text(format!("Progress: {progress_label}")),
+                        text(format!("Elapsed: {elapsed_label}")),
+                        text(totals_label),
+                        text(bytes_label)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    progress_bar(0.0..=100.0, progress_value),
+                    container(
+                        scrollable(text(logs_text).size(14))
+                            .id("upload-log-scroll")
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(10)
+                    .style(iced::widget::container::rounded_box),
+                ]
+                .spacing(14)
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+                let upload_modal_layer = container(
+                    container(upload_modal_content)
+                        .padding(16)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .max_width(1024)
+                        .max_height(700)
+                        .style(iced::widget::container::rounded_box),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(iced::Padding::new(24.0))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|theme: &iced::Theme| {
+                    let mut overlay = theme.extended_palette().background.base.color;
+                    overlay.a = 0.65;
+
+                    iced::widget::container::Style {
+                        background: Some(Background::Color(overlay)),
+                        ..iced::widget::container::Style::default()
+                    }
+                });
+
+                layered = stack![layered, opaque(upload_modal_layer)]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
+
+            if app.show_upload_credentials_modal {
+                let access_key = app.upload_credentials_form.access_key_id.trim();
+                let secret_key = app.upload_credentials_form.secret_access_key.trim();
+                let credentials_valid = (access_key.is_empty() && secret_key.is_empty())
+                    || (!access_key.is_empty() && !secret_key.is_empty());
+
+                let save_button = if credentials_valid {
+                    button("Save").on_press(Message::UploadCredentialSavePressed)
+                } else {
+                    button("Save")
+                };
+
+                let credentials_modal_content = column![
+                    row![
+                        text("AWS Credentials").size(24).width(Length::Fill),
+                        button("Close").on_press(Message::UploadCredentialsPromptClose)
+                    ]
+                    .align_y(Alignment::Center),
+                    text("Leave Access Key and Secret Key empty to use the AWS default credential chain."),
+                    row![
+                        text("Region").width(Length::Fixed(220.0)),
+                        text_input("eu-north-1", &app.upload_credentials_form.region)
+                            .on_input(Message::UploadCredentialRegionChanged)
+                            .width(Length::Fill)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    row![
+                        text("Access Key ID").width(Length::Fixed(220.0)),
+                        text_input("", &app.upload_credentials_form.access_key_id)
+                            .on_input(Message::UploadCredentialAccessKeyChanged)
+                            .width(Length::Fill)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    row![
+                        text("Secret Access Key").width(Length::Fixed(220.0)),
+                        text_input("", &app.upload_credentials_form.secret_access_key)
+                            .on_input(Message::UploadCredentialSecretKeyChanged)
+                            .width(Length::Fill)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    row![
+                        text("Session Token").width(Length::Fixed(220.0)),
+                        text_input("", &app.upload_credentials_form.session_token)
+                            .on_input(Message::UploadCredentialSessionTokenChanged)
+                            .width(Length::Fill)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    container(save_button)
+                        .width(Length::Fill)
+                        .align_x(iced::alignment::Horizontal::Right)
+                ]
+                .spacing(14)
+                .width(Length::Fill);
+
+                let credentials_modal_layer = container(
+                    container(credentials_modal_content)
+                        .padding(16)
+                        .width(Length::Fill)
+                        .max_width(860)
+                        .style(iced::widget::container::rounded_box),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(iced::Padding::new(40.0))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|theme: &iced::Theme| {
+                    let mut overlay = theme.extended_palette().background.base.color;
+                    overlay.a = 0.7;
+
+                    iced::widget::container::Style {
+                        background: Some(Background::Color(overlay)),
+                        ..iced::widget::container::Style::default()
+                    }
+                });
+
+                layered = stack![layered, opaque(credentials_modal_layer)]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
+
             layered
         }
         _ => container(
@@ -708,5 +975,21 @@ fn format_duration(duration: Duration) -> String {
         format!("{hours:02}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    if bytes as f64 >= GB {
+        format!("{:.2} GiB", bytes as f64 / GB)
+    } else if bytes as f64 >= MB {
+        format!("{:.2} MiB", bytes as f64 / MB)
+    } else if bytes as f64 >= KB {
+        format!("{:.2} KiB", bytes as f64 / KB)
+    } else {
+        format!("{bytes} B")
     }
 }

@@ -1,10 +1,15 @@
 use crate::app::{
     AppState, AudioCodec, EncodeOptionsForm, EncodeProgress, EncodeRuntimeState, EncodeStatus,
-    EncodeWorkerEvent, HLSenpai, HlsPlaylistType, VideoCodecLib, VideoProfile, X264Preset,
+    EncodeWorkerEvent, HLSenpai, HlsPlaylistType, UploadRuntimeState, UploadStatus, VideoCodecLib,
+    VideoProfile, X264Preset,
 };
-use crate::config::apply_preset_to_form;
+use crate::config::{apply_preset_to_form, save_auth_config};
 use crate::ff_helpers::{
     PreviewVideo, extract_video_metadata, validate_video_file, video_metadata_markdown_sections,
+};
+use crate::upload::{
+    S3UploadRequest, UploadOverwriteMode, UploadTargetKind, UploadWorkerEvent,
+    start_s3_upload_worker,
 };
 use iced::Task;
 use iced::widget::markdown;
@@ -61,6 +66,22 @@ pub(crate) enum Message {
     EncodePollTick,
     EncodeLogModalOpen,
     EncodeLogModalClose,
+    UploadToPressed,
+    UploadModalClose,
+    UploadPollTick,
+    UploadTargetSelected(UploadTargetKind),
+    UploadBucketChanged(String),
+    UploadPrefixChanged(String),
+    UploadOverwriteModeSelected(UploadOverwriteMode),
+    UploadStartPressed,
+    UploadCancelPressed,
+    UploadCredentialsPromptOpen,
+    UploadCredentialsPromptClose,
+    UploadCredentialRegionChanged(String),
+    UploadCredentialAccessKeyChanged(String),
+    UploadCredentialSecretKeyChanged(String),
+    UploadCredentialSessionTokenChanged(String),
+    UploadCredentialSavePressed,
     PrintFfmpegScript,
     CloseFfmpegScriptPopup,
 }
@@ -72,7 +93,11 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
         Message::SelectFilePressed => {
             app.ffmpeg_script_popup = None;
             app.encode_runtime = None;
+            app.upload_runtime = None;
             app.show_encode_log_modal = false;
+            app.show_upload_modal = false;
+            app.show_upload_credentials_modal = false;
+            app.last_encode_output_root = None;
 
             let selection = rfd::FileDialog::new()
                 .set_title("Select a video file")
@@ -487,6 +512,10 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 let duration_ms = seconds_to_ffmpeg_progress_units(video.metadata.duration_seconds);
                 let has_audio = video.metadata.audio_codec.is_some();
 
+                app.last_encode_output_root = None;
+                app.upload_runtime = None;
+                app.show_upload_modal = false;
+                app.show_upload_credentials_modal = false;
                 app.encode_runtime = Some(EncodeRuntimeState::new(
                     receiver,
                     Arc::clone(&cancel_flag),
@@ -539,6 +568,10 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     log_lines_appended = true;
                 }
 
+                if runtime.status == EncodeStatus::Success {
+                    app.last_encode_output_root = runtime.output_root.clone();
+                }
+
                 if log_lines_appended && app.show_encode_log_modal {
                     return iced::widget::operation::snap_to_end("encode-log-scroll");
                 }
@@ -550,6 +583,207 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
         }
         Message::EncodeLogModalClose => {
             app.show_encode_log_modal = false;
+        }
+        Message::UploadToPressed => {
+            if !encode_is_success(app) {
+                return Task::none();
+            }
+
+            app.show_upload_modal = true;
+            app.show_upload_credentials_modal = false;
+
+            app.upload_form.available_targets = available_upload_targets(app);
+            if app.upload_form.selected_target.is_none()
+                && app
+                    .upload_form
+                    .available_targets
+                    .contains(&UploadTargetKind::AwsS3)
+            {
+                app.upload_form.selected_target = Some(UploadTargetKind::AwsS3);
+            }
+
+            hydrate_upload_form_from_auth(app);
+            if !credentials_ready_for_s3(app) {
+                hydrate_credentials_form_from_auth(app);
+                app.show_upload_credentials_modal = true;
+            }
+            app.persist_upload_prefs();
+        }
+        Message::UploadModalClose => {
+            app.show_upload_modal = false;
+            app.show_upload_credentials_modal = false;
+        }
+        Message::UploadPollTick => {
+            if let Some(runtime) = app.upload_runtime.as_mut() {
+                let mut disconnected = false;
+                let mut log_lines_appended = false;
+
+                loop {
+                    match runtime.receiver.try_recv() {
+                        Ok(event) => {
+                            log_lines_appended |= apply_upload_worker_event(runtime, event);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if disconnected && runtime.is_running() {
+                    runtime.status = UploadStatus::Failed;
+                    runtime.append_log_line("Upload worker disconnected unexpectedly.".to_string());
+                    log_lines_appended = true;
+                }
+
+                if log_lines_appended && app.show_upload_modal {
+                    return iced::widget::operation::snap_to_end("upload-log-scroll");
+                }
+            }
+        }
+        Message::UploadTargetSelected(value) => {
+            app.upload_form.selected_target = Some(value);
+            hydrate_upload_form_from_auth(app);
+            app.persist_upload_prefs();
+        }
+        Message::UploadBucketChanged(value) => {
+            app.upload_form.bucket = value;
+            app.persist_upload_prefs();
+        }
+        Message::UploadPrefixChanged(value) => {
+            app.upload_form.prefix = value;
+            app.persist_upload_prefs();
+        }
+        Message::UploadOverwriteModeSelected(value) => {
+            app.upload_form.overwrite_mode = value;
+            app.persist_upload_prefs();
+        }
+        Message::UploadStartPressed => {
+            if app
+                .upload_runtime
+                .as_ref()
+                .is_some_and(UploadRuntimeState::is_running)
+            {
+                return Task::none();
+            }
+
+            let Some(output_root) = app.last_encode_output_root.clone() else {
+                eprintln!("Cannot upload: no successful encode output folder is available.");
+                return Task::none();
+            };
+
+            if app.upload_form.selected_target != Some(UploadTargetKind::AwsS3) {
+                eprintln!("Cannot upload: no upload target selected.");
+                return Task::none();
+            }
+
+            if app.upload_form.bucket.trim().is_empty() {
+                eprintln!("Cannot upload: S3 bucket is empty.");
+                return Task::none();
+            }
+
+            if !credentials_ready_for_s3(app) {
+                app.show_upload_credentials_modal = true;
+                return Task::none();
+            }
+
+            let (sender, receiver) = mpsc::channel();
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+
+            app.upload_runtime = Some(UploadRuntimeState::new(receiver, Arc::clone(&cancel_flag)));
+            app.show_upload_modal = true;
+
+            let request = S3UploadRequest {
+                local_dir: output_root,
+                bucket: app.upload_form.bucket.trim().to_string(),
+                prefix: app.upload_form.prefix.trim().to_string(),
+                region: aws_provider_extra_value(app, "region"),
+                access_key_id: aws_provider_extra_value(app, "access_key_id"),
+                secret_access_key: aws_provider_extra_value(app, "secret_access_key"),
+                session_token: aws_provider_extra_value(app, "session_token"),
+                overwrite_mode: app.upload_form.overwrite_mode,
+            };
+
+            start_s3_upload_worker(request, sender, Arc::clone(&cancel_flag));
+            app.persist_upload_prefs();
+            return iced::widget::operation::snap_to_end("upload-log-scroll");
+        }
+        Message::UploadCancelPressed => {
+            if let Some(runtime) = app.upload_runtime.as_mut()
+                && runtime.can_cancel()
+            {
+                runtime.status = UploadStatus::Canceling;
+                runtime.cancel_flag.store(true, Ordering::Relaxed);
+                runtime.append_log_line("Upload cancellation requested...".to_string());
+            }
+        }
+        Message::UploadCredentialsPromptOpen => {
+            hydrate_credentials_form_from_auth(app);
+            app.show_upload_credentials_modal = true;
+        }
+        Message::UploadCredentialsPromptClose => {
+            app.show_upload_credentials_modal = false;
+        }
+        Message::UploadCredentialRegionChanged(value) => {
+            app.upload_credentials_form.region = value;
+        }
+        Message::UploadCredentialAccessKeyChanged(value) => {
+            app.upload_credentials_form.access_key_id = value;
+        }
+        Message::UploadCredentialSecretKeyChanged(value) => {
+            app.upload_credentials_form.secret_access_key = value;
+        }
+        Message::UploadCredentialSessionTokenChanged(value) => {
+            app.upload_credentials_form.session_token = value;
+        }
+        Message::UploadCredentialSavePressed => {
+            if !credentials_form_is_valid(app) {
+                return Task::none();
+            }
+
+            let provider = app
+                .auth_config
+                .providers
+                .entry("aws".to_string())
+                .or_default();
+            set_or_remove_extra(
+                provider,
+                "region",
+                non_empty(&app.upload_credentials_form.region),
+            );
+            set_or_remove_extra(
+                provider,
+                "access_key_id",
+                non_empty(&app.upload_credentials_form.access_key_id),
+            );
+            set_or_remove_extra(
+                provider,
+                "secret_access_key",
+                non_empty(&app.upload_credentials_form.secret_access_key),
+            );
+            set_or_remove_extra(
+                provider,
+                "session_token",
+                non_empty(&app.upload_credentials_form.session_token),
+            );
+
+            if let Err(err) = save_auth_config(&app.config_paths, &app.auth_config) {
+                eprintln!("Could not save auth config after credentials update: {err}");
+            }
+
+            app.upload_form.available_targets = available_upload_targets(app);
+            if app.upload_form.selected_target.is_none()
+                && app
+                    .upload_form
+                    .available_targets
+                    .contains(&UploadTargetKind::AwsS3)
+            {
+                app.upload_form.selected_target = Some(UploadTargetKind::AwsS3);
+            }
+            hydrate_upload_form_from_auth(app);
+            app.persist_upload_prefs();
+            app.show_upload_credentials_modal = false;
         }
         Message::PrintFfmpegScript => {
             if let (Some(video), Some(form)) = (app.video.as_ref(), app.encode_options.as_ref()) {
@@ -612,7 +846,9 @@ fn apply_encode_worker_event(runtime: &mut EncodeRuntimeState, event: EncodeWork
         EncodeWorkerEvent::Finished {
             exit_code,
             was_canceled,
+            output_root,
         } => {
+            runtime.output_root = Some(output_root);
             if was_canceled {
                 runtime.status = EncodeStatus::Canceled;
                 runtime.append_log_line("Encode canceled.".to_string());
@@ -641,6 +877,143 @@ fn apply_encode_worker_event(runtime: &mut EncodeRuntimeState, event: EncodeWork
     }
 
     log_changed
+}
+
+fn apply_upload_worker_event(runtime: &mut UploadRuntimeState, event: UploadWorkerEvent) -> bool {
+    let mut log_changed = false;
+
+    match event {
+        UploadWorkerEvent::Started {
+            total_files,
+            total_bytes,
+        } => {
+            runtime.total_files = total_files;
+            runtime.total_bytes = total_bytes;
+            runtime.append_log_line(format!(
+                "Upload worker started. Files: {total_files}, total bytes: {total_bytes}"
+            ));
+            log_changed = true;
+        }
+        UploadWorkerEvent::LogLine(line) => {
+            runtime.append_log_line(line);
+            log_changed = true;
+        }
+        UploadWorkerEvent::Progress(progress) => {
+            runtime.apply_progress(&progress);
+        }
+        UploadWorkerEvent::Finished {
+            summary,
+            was_canceled,
+        } => {
+            runtime.apply_progress(&summary);
+            if was_canceled {
+                runtime.status = UploadStatus::Canceled;
+                runtime.append_log_line("Upload canceled.".to_string());
+            } else if summary.failed_files == 0 {
+                runtime.status = UploadStatus::Success;
+                runtime.progress_percent = Some(100.0);
+                runtime.append_log_line(format!(
+                    "Upload completed successfully. Uploaded: {}, skipped: {}, failed: {}",
+                    summary.uploaded_files, summary.skipped_files, summary.failed_files
+                ));
+            } else {
+                runtime.status = UploadStatus::Failed;
+                runtime.append_log_line(format!(
+                    "Upload finished with failures. Uploaded: {}, skipped: {}, failed: {}",
+                    summary.uploaded_files, summary.skipped_files, summary.failed_files
+                ));
+            }
+            log_changed = true;
+        }
+        UploadWorkerEvent::SpawnError(message) => {
+            runtime.status = UploadStatus::Failed;
+            runtime.append_log_line(format!("Could not start upload: {message}"));
+            log_changed = true;
+        }
+    }
+
+    log_changed
+}
+
+fn encode_is_success(app: &HLSenpai) -> bool {
+    app.encode_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.status == EncodeStatus::Success)
+        && app.last_encode_output_root.is_some()
+}
+
+fn available_upload_targets(app: &HLSenpai) -> Vec<UploadTargetKind> {
+    let mut targets = Vec::new();
+    if app.auth_config.providers.contains_key("aws") {
+        targets.push(UploadTargetKind::AwsS3);
+    }
+    targets
+}
+
+fn aws_provider_extra_value(app: &HLSenpai, key: &str) -> Option<String> {
+    app.auth_config
+        .providers
+        .get("aws")
+        .and_then(|provider| provider.extra.get(key))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn hydrate_upload_form_from_auth(app: &mut HLSenpai) {
+    if app.upload_form.selected_target != Some(UploadTargetKind::AwsS3) {
+        return;
+    }
+
+    if app.upload_form.bucket.trim().is_empty()
+        && let Some(bucket) = aws_provider_extra_value(app, "bucket")
+    {
+        app.upload_form.bucket = bucket;
+    }
+
+    if app.upload_form.prefix.trim().is_empty()
+        && let Some(prefix) = aws_provider_extra_value(app, "default_prefix")
+    {
+        app.upload_form.prefix = prefix;
+    }
+}
+
+fn hydrate_credentials_form_from_auth(app: &mut HLSenpai) {
+    app.upload_credentials_form.region =
+        aws_provider_extra_value(app, "region").unwrap_or_default();
+    app.upload_credentials_form.access_key_id =
+        aws_provider_extra_value(app, "access_key_id").unwrap_or_default();
+    app.upload_credentials_form.secret_access_key =
+        aws_provider_extra_value(app, "secret_access_key").unwrap_or_default();
+    app.upload_credentials_form.session_token =
+        aws_provider_extra_value(app, "session_token").unwrap_or_default();
+}
+
+fn credentials_ready_for_s3(app: &HLSenpai) -> bool {
+    let access_key = aws_provider_extra_value(app, "access_key_id");
+    let secret_key = aws_provider_extra_value(app, "secret_access_key");
+    matches!(
+        (access_key.as_deref(), secret_key.as_deref()),
+        (Some(_), Some(_)) | (None, None)
+    )
+}
+
+fn credentials_form_is_valid(app: &HLSenpai) -> bool {
+    let access_key = app.upload_credentials_form.access_key_id.trim();
+    let secret_key = app.upload_credentials_form.secret_access_key.trim();
+    (access_key.is_empty() && secret_key.is_empty())
+        || (!access_key.is_empty() && !secret_key.is_empty())
+}
+
+fn set_or_remove_extra(
+    provider: &mut crate::config::AuthProviderConfig,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        provider.extra.insert(key.to_string(), value);
+    } else {
+        provider.extra.remove(key);
+    }
 }
 
 fn start_encode_worker(
@@ -742,6 +1115,7 @@ fn run_encode_worker(
     let _ = sender.send(EncodeWorkerEvent::Finished {
         exit_code,
         was_canceled,
+        output_root,
     });
 }
 

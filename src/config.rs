@@ -51,6 +51,7 @@ pub(crate) struct ConfigPaths {
     pub dir: PathBuf,
     pub auth_file: PathBuf,
     pub preset_file: PathBuf,
+    pub upload_prefs_file: PathBuf,
 }
 
 impl ConfigPaths {
@@ -83,6 +84,7 @@ impl ConfigPaths {
         Self {
             auth_file: dir.join("auth_config.json"),
             preset_file: dir.join("encoding_presets.json"),
+            upload_prefs_file: dir.join("upload_prefs.json"),
             dir,
         }
     }
@@ -152,6 +154,22 @@ pub(crate) struct PersistedEncodePreset {
     pub output_master_playlist_file: String,
     #[serde(default)]
     pub variants: Vec<VariantForm>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) struct PersistedUploadPrefs {
+    #[serde(default = "default_config_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub last_upload_provider: Option<String>,
+    #[serde(default)]
+    pub last_overwrite_mode: Option<String>,
+    #[serde(default)]
+    pub last_bucket: Option<String>,
+    #[serde(default)]
+    pub last_prefix: Option<String>,
+    #[serde(default)]
+    pub updated_at_utc: Option<String>,
 }
 
 impl PersistedEncodePreset {
@@ -275,6 +293,44 @@ pub(crate) fn save_last_preset(
     };
 
     write_json_atomic(&paths.dir, &paths.preset_file, &cfg)?;
+    Ok(())
+}
+
+pub(crate) fn load_upload_prefs(paths: &ConfigPaths) -> Result<PersistedUploadPrefs, ConfigError> {
+    let content = match fs::read_to_string(&paths.upload_prefs_file) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(PersistedUploadPrefs::default()),
+        Err(err) => return Err(ConfigError::Io(err)),
+    };
+
+    let mut prefs: PersistedUploadPrefs = match serde_json::from_str(&content) {
+        Ok(prefs) => prefs,
+        Err(err) => {
+            backup_broken_file(&paths.upload_prefs_file);
+            eprintln!(
+                "Invalid upload prefs JSON at {}: {}",
+                paths.upload_prefs_file.display(),
+                err
+            );
+            return Ok(PersistedUploadPrefs::default());
+        }
+    };
+
+    if prefs.version == 0 {
+        prefs.version = CONFIG_VERSION;
+    }
+
+    Ok(prefs)
+}
+
+pub(crate) fn save_upload_prefs(
+    paths: &ConfigPaths,
+    prefs: &PersistedUploadPrefs,
+) -> Result<(), ConfigError> {
+    let mut to_write = prefs.clone();
+    to_write.version = CONFIG_VERSION;
+    to_write.updated_at_utc = Some(now_utc_unix_string());
+    write_json_atomic(&paths.dir, &paths.upload_prefs_file, &to_write)?;
     Ok(())
 }
 
@@ -558,5 +614,31 @@ mod tests {
         assert_eq!(loaded.variants[0].video_bitrate_k, 1);
         assert_eq!(loaded.variants[1].name, "med");
         assert_eq!(loaded.variants[2].name, "high");
+    }
+
+    #[test]
+    fn upload_prefs_round_trip_save_and_load() {
+        let dir = unique_temp_dir();
+        let paths = ConfigPaths::from_dir(dir);
+
+        let prefs = PersistedUploadPrefs {
+            version: 1,
+            last_upload_provider: Some("aws_s3".to_string()),
+            last_overwrite_mode: Some("skip_existing".to_string()),
+            last_bucket: Some("example-bucket".to_string()),
+            last_prefix: Some("vod/demo".to_string()),
+            updated_at_utc: None,
+        };
+
+        save_upload_prefs(&paths, &prefs).expect("upload prefs should save");
+        let loaded = load_upload_prefs(&paths).expect("upload prefs should load");
+
+        assert_eq!(loaded.last_upload_provider, Some("aws_s3".to_string()));
+        assert_eq!(
+            loaded.last_overwrite_mode,
+            Some("skip_existing".to_string())
+        );
+        assert_eq!(loaded.last_bucket, Some("example-bucket".to_string()));
+        assert_eq!(loaded.last_prefix, Some("vod/demo".to_string()));
     }
 }
