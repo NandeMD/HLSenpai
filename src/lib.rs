@@ -8,5 +8,6 @@ pub fn run() -> iced::Result {
         app::HLSenpai::update,
         app::HLSenpai::view,
     )
+    .theme(app::HLSenpai::theme)
     .run()
 }

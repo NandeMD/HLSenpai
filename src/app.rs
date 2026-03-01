@@ -1,5 +1,5 @@
 use iced::widget::{button, column, container, text};
-use iced::{Alignment, Element, Length, Task};
+use iced::{Alignment, Element, Length, Task, Theme};
 
 use crate::message::*;
 
@@ -35,5 +35,9 @@ impl HLSenpai {
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into()
+    }
+
+    pub(crate) fn theme(&self) -> Theme {
+        Theme::TokyoNightStorm
     }
 }
