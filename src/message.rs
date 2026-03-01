@@ -1,4 +1,4 @@
-use crate::app::HLSenpai;
+use crate::app::{AppState, HLSenpai};
 use crate::ff_helpers::validate_video_file;
 use iced::Task;
 
@@ -18,16 +18,32 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 )
                 .pick_file();
 
-            app.status = match selection {
+            app.video = match selection {
                 Some(path) => match validate_video_file(&path) {
-                    Ok(()) => format!("Selected file is valid: {}", path.display()),
-                    Err(reason) => format!(
-                        "Selected file is not a valid supported video:\n{}\nReason: {}",
-                        path.display(),
-                        reason
-                    ),
+                    Ok(()) => {
+                        println!("Selected file: {}", path.display());
+                        app.state = AppState::VideoOverview;
+                        Some(path)
+                    }
+                    Err(reason) => {
+                        let err_msg = format!(
+                            "Selected file is not a valid supported video:\n{}\nReason: {}",
+                            path.display(),
+                            reason
+                        );
+                        let _ = rfd::MessageDialog::new()
+                            .set_title("Format Not Supported")
+                            .set_description(&err_msg)
+                            .set_buttons(rfd::MessageButtons::Ok)
+                            .show();
+                        eprintln!("{err_msg}");
+                        None
+                    }
                 },
-                None => "File selection cancelled".to_string(),
+                None => {
+                    eprintln!("File selection cancelled");
+                    None
+                }
             };
         }
     }

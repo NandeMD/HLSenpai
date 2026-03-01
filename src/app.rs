@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::message::*;
 use crate::views;
 
@@ -7,11 +9,12 @@ use iced::{Element, Task, Theme};
 pub(crate) enum AppState {
     #[default]
     Initial,
+    VideoOverview,
 }
 
 #[derive(Default)]
 pub(crate) struct HLSenpai {
-    pub status: String,
+    pub video: Option<PathBuf>,
     pub state: AppState,
 }
 
@@ -27,6 +30,7 @@ impl HLSenpai {
     pub(crate) fn view(&self) -> Element<'_, Message> {
         match self.state {
             AppState::Initial => views::select_file(self),
+            AppState::VideoOverview => views::video_overview(self),
         }
     }
 
