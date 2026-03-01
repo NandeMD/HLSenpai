@@ -35,6 +35,15 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Cache Windows vcpkg artifacts
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}\vcpkg\installed
+            ${{ runner.temp }}\vcpkg\downloads
+          key: vcpkg-${{ runner.os }}-${{ runner.arch }}-ffmpeg-x64-windows-v1
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -81,19 +90,30 @@ jobs:
           choco install -y pkgconfiglite
           "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
-          git clone https://github.com/microsoft/vcpkg $vcpkgRoot
-          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          if (-not (Test-Path "$vcpkgRoot\vcpkg.exe")) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg $vcpkgRoot
+            & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          }
           & "$vcpkgRoot\vcpkg.exe" install ffmpeg:x64-windows
           "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "VCPKGRS_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           choco install -y gstreamer gstreamer-devel
           $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
-          if (Test-Path $gstRoot) {
-            "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-            "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig;$env:PKG_CONFIG_PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not (Test-Path $gstRoot)) {
+            throw "Expected GStreamer root not found at $gstRoot"
           }
+          $pkgConfigPath = Join-Path $gstRoot "lib\pkgconfig"
+          $glibPcPath = Join-Path $pkgConfigPath "glib-2.0.pc"
+          if (-not (Test-Path $glibPcPath)) {
+            throw "glib-2.0.pc not found at $glibPcPath"
+          }
+          "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "PKG_CONFIG_PATH=$pkgConfigPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG=C:\ProgramData\chocolatey\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & "C:\ProgramData\chocolatey\bin\pkg-config.exe" --modversion glib-2.0
+          & "C:\ProgramData\chocolatey\bin\pkg-config.exe" --modversion gstreamer-1.0
 
       - name: Build release binary
         run: cargo build --release
