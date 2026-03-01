@@ -1,6 +1,5 @@
 
 All perfectly GOP-aligned.  
-All 720p.  
 All adaptive.  
 
 Just how senpai likes it.
@@ -9,7 +8,7 @@ Just how senpai likes it.
 
 ## 🔥 Features
 
-- 720p multi-bitrate ladder (low / medium / high)
+- Multi-bitrate ladder (low / medium / high)
 - Strict GOP alignment (2×FPS)
 - Independent segments
 - CloudFront-ready folder structure
@@ -44,7 +43,7 @@ Just clean, predictable output.
 | GUI | `iced` |
 | Core | Rust |
 | Video Engine | `rust-ffmpeg` |
-| Codec | libx264 |
+| Codec | libx264 (but preferably others) |
 | Audio | AAC |
 | Output | HLS (TS) |
 | Deployment Target | AWS S3 + CloudFront |
@@ -91,12 +90,14 @@ HLSenpai makes the right choices by default.
 - A respectable internet connection
 - Good taste
 
+For full installation, build, AWS credential setup, config files, and troubleshooting docs, see [USAGE.md](./USAGE.md).
+
 ---
 
 ## 🧎 A Final Note
 
 HLSenpai does not judge your input videos.  
-It simply scales them to 720p and makes them stream-ready.
+It simply takes and makes them stream-ready.
 
 Gracefully.  
 Efficiently.  
