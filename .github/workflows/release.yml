@@ -99,9 +99,13 @@ jobs:
           "VCPKGRS_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           choco install -y gstreamer gstreamer-devel
-          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
-          if (-not (Test-Path $gstRoot)) {
-            throw "Expected GStreamer root not found at $gstRoot"
+          $gstRootCandidates = @(
+            "C:\gstreamer\1.0\msvc_x86_64",
+            "C:\Program Files\gstreamer\1.0\msvc_x86_64"
+          )
+          $gstRoot = $gstRootCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $gstRoot) {
+            throw "Expected GStreamer root not found. Checked: $($gstRootCandidates -join ', ')"
           }
           $pkgConfigPath = Join-Path $gstRoot "lib\pkgconfig"
           $glibPcPath = Join-Path $pkgConfigPath "glib-2.0.pc"
