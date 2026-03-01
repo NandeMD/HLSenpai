@@ -1,11 +1,18 @@
-use iced::widget::{button, column, container, text};
-use iced::{Alignment, Element, Length, Task, Theme};
-
 use crate::message::*;
+use crate::views;
+
+use iced::{Element, Task, Theme};
+
+#[derive(Default)]
+pub(crate) enum AppState {
+    #[default]
+    Initial,
+}
 
 #[derive(Default)]
 pub(crate) struct HLSenpai {
     pub status: String,
+    pub state: AppState,
 }
 
 impl HLSenpai {
@@ -18,23 +25,9 @@ impl HLSenpai {
     }
 
     pub(crate) fn view(&self) -> Element<'_, Message> {
-        let content = column![
-            button("Select File").on_press(Message::SelectFilePressed),
-            text(if self.status.is_empty() {
-                "Pick a file to validate with ffmpeg"
-            } else {
-                &self.status
-            })
-        ]
-        .spacing(16)
-        .align_x(Alignment::Center);
-
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into()
+        match self.state {
+            AppState::Initial => views::select_file(self),
+        }
     }
 
     pub(crate) fn theme(&self) -> Theme {
