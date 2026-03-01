@@ -449,7 +449,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
             if let (Some(video), Some(form)) = (app.video.as_ref(), app.encode_options.as_ref()) {
                 let (sender, receiver) = mpsc::channel();
                 let cancel_flag = Arc::new(AtomicBool::new(false));
-                let duration_ms = seconds_to_ms(video.metadata.duration_seconds);
+                let duration_ms = seconds_to_ffmpeg_progress_units(video.metadata.duration_seconds);
                 let has_audio = video.metadata.audio_codec.is_some();
 
                 app.encode_runtime = Some(EncodeRuntimeState::new(
@@ -936,10 +936,11 @@ fn parse_i32(value: &str) -> Option<i32> {
     value.trim().parse::<i32>().ok()
 }
 
-fn seconds_to_ms(value: Option<f64>) -> Option<u64> {
+fn seconds_to_ffmpeg_progress_units(value: Option<f64>) -> Option<u64> {
     let seconds = value?;
     if seconds.is_finite() && seconds > 0.0 {
-        Some((seconds * 1000.0) as u64)
+        // ffmpeg `-progress` reports `out_time_ms` in microseconds despite the field name.
+        Some((seconds * 1_000_000.0) as u64)
     } else {
         None
     }
