@@ -598,6 +598,7 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                     progress_bar(0.0..=100.0, progress_value),
                     container(
                         scrollable(text(logs_text).size(14))
+                            .id("encode-log-scroll")
                             .width(Length::Fill)
                             .height(Length::Fill)
                     )

@@ -480,10 +480,13 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
         Message::EncodePollTick => {
             if let Some(runtime) = app.encode_runtime.as_mut() {
                 let mut disconnected = false;
+                let mut log_lines_appended = false;
 
                 loop {
                     match runtime.receiver.try_recv() {
-                        Ok(event) => apply_encode_worker_event(runtime, event),
+                        Ok(event) => {
+                            log_lines_appended |= apply_encode_worker_event(runtime, event);
+                        }
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => {
                             disconnected = true;
@@ -496,11 +499,17 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     runtime.status = EncodeStatus::Failed;
                     runtime
                         .append_log_line("Encoding worker disconnected unexpectedly.".to_string());
+                    log_lines_appended = true;
+                }
+
+                if log_lines_appended && app.show_encode_log_modal {
+                    return iced::widget::operation::snap_to_end("encode-log-scroll");
                 }
             }
         }
         Message::EncodeLogModalOpen => {
             app.show_encode_log_modal = true;
+            return iced::widget::operation::snap_to_end("encode-log-scroll");
         }
         Message::EncodeLogModalClose => {
             app.show_encode_log_modal = false;
@@ -523,13 +532,17 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
     Task::none()
 }
 
-fn apply_encode_worker_event(runtime: &mut EncodeRuntimeState, event: EncodeWorkerEvent) {
+fn apply_encode_worker_event(runtime: &mut EncodeRuntimeState, event: EncodeWorkerEvent) -> bool {
+    let mut log_changed = false;
+
     match event {
         EncodeWorkerEvent::Started => {
             runtime.append_log_line("ffmpeg process started.".to_string());
+            log_changed = true;
         }
         EncodeWorkerEvent::LogLine(line) => {
             runtime.append_log_line(line);
+            log_changed = true;
         }
         EncodeWorkerEvent::Progress(progress) => {
             if let Some(out_time_ms) = progress.out_time_ms {
@@ -562,10 +575,12 @@ fn apply_encode_worker_event(runtime: &mut EncodeRuntimeState, event: EncodeWork
             if was_canceled {
                 runtime.status = EncodeStatus::Canceled;
                 runtime.append_log_line("Encode canceled.".to_string());
+                log_changed = true;
             } else if exit_code == Some(0) {
                 runtime.status = EncodeStatus::Success;
                 runtime.progress_percent = Some(100.0);
                 runtime.append_log_line("Encode completed successfully.".to_string());
+                log_changed = true;
             } else {
                 runtime.status = EncodeStatus::Failed;
                 runtime.append_log_line(format!(
@@ -574,13 +589,17 @@ fn apply_encode_worker_event(runtime: &mut EncodeRuntimeState, event: EncodeWork
                         .map(|code| code.to_string())
                         .unwrap_or_else(|| "unknown".to_string())
                 ));
+                log_changed = true;
             }
         }
         EncodeWorkerEvent::SpawnError(message) => {
             runtime.status = EncodeStatus::Failed;
             runtime.append_log_line(format!("Could not start ffmpeg: {message}"));
+            log_changed = true;
         }
     }
+
+    log_changed
 }
 
 fn start_encode_worker(
