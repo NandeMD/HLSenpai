@@ -8,7 +8,7 @@ use crate::ff_helpers::{
 use iced::Task;
 use iced::widget::markdown;
 use iced_video_player::Video;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -49,11 +49,15 @@ pub(crate) enum Message {
     EncodeVariantMaxrateChanged(usize, String),
     EncodeVariantBufsizeChanged(usize, String),
     EncodeVariantAudioBitrateChanged(usize, String),
+    PrintFfmpegScript,
+    CloseFfmpegScriptPopup,
 }
 
 pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Message> {
     match message {
         Message::SelectFilePressed => {
+            app.ffmpeg_script_popup = None;
+
             let selection = rfd::FileDialog::new()
                 .set_title("Select a video file")
                 .add_filter(
@@ -174,6 +178,8 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
             }
         }
         Message::BackToVideoOverview => {
+            app.ffmpeg_script_popup = None;
+
             if app.video.is_some() {
                 app.state = AppState::VideoOverview;
             } else {
@@ -409,9 +415,150 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 variant.audio_bitrate_k = parsed.max(1);
             }
         }
+        Message::PrintFfmpegScript => {
+            if let (Some(video), Some(form)) = (app.video.as_ref(), app.encode_options.as_ref()) {
+                let script = build_ffmpeg_script(&video._path, form);
+                let markdown_script = ffmpeg_script_popup_markdown(&script);
+                app.ffmpeg_script_popup = Some(markdown::Content::parse(&markdown_script));
+            } else {
+                eprintln!("Cannot build ffmpeg script: no video or encode options are available.");
+            }
+        }
+        Message::CloseFfmpegScriptPopup => {
+            app.ffmpeg_script_popup = None;
+        }
     }
 
     Task::none()
+}
+
+fn build_ffmpeg_script(input_path: &Path, form: &EncodeOptionsForm) -> String {
+    let output_root = output_root_folder(form);
+    let output_root_string = output_root.to_string_lossy().to_string();
+    let segment_pattern =
+        non_empty(&form.segment_filename_pattern).unwrap_or_else(|| "v%v/seg_%06d.ts".to_string());
+    let variant_playlist_pattern = non_empty(&form.output_variant_playlist_pattern)
+        .unwrap_or_else(|| "v%v/prog.m3u8".to_string());
+    let master_playlist_name = non_empty(&form.output_master_playlist_file)
+        .or_else(|| non_empty(&form.master_playlist_name))
+        .unwrap_or_else(|| "master.m3u8".to_string());
+
+    let segment_filename = output_root.join(segment_pattern);
+    let variant_playlist = output_root.join(variant_playlist_pattern);
+
+    let video_encoder = video_encoder_name(form.video_codec_lib);
+    let audio_encoder = audio_encoder_name(form.audio_codec);
+    let profile = ffmpeg_profile_value(form.video_codec_lib, form.profile);
+    let preset_argument = codec_preset_argument(form.video_codec_lib, form.preset);
+
+    let split_outputs = (0..form.variants.len())
+        .map(|index| format!("[v{index}]"))
+        .collect::<Vec<_>>()
+        .join("");
+
+    let scale_chains = (0..form.variants.len())
+        .map(|index| {
+            format!(
+                "[v{index}]scale={}:{}:flags=lanczos[v{index}out]",
+                form.scale_width, form.scale_height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+
+    let filter_complex = format!(
+        "[0:v]split={count}{split_outputs};{scale_chains}",
+        count = form.variants.len()
+    );
+
+    let var_stream_map = form
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(index, variant)| {
+            format!(
+                "v:{index},a:{index},name:{}",
+                sanitize_variant_name(&variant.name, index)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut lines = vec![
+        "#!/usr/bin/env bash".to_string(),
+        "set -euo pipefail".to_string(),
+        format!("mkdir -p {}", sh_quote(&output_root_string)),
+        "ffmpeg -y \\".to_string(),
+        format!("  -i {} \\", sh_quote(&input_path.to_string_lossy())),
+        format!("  -filter_complex {} \\", sh_quote(&filter_complex)),
+    ];
+
+    for (index, variant) in form.variants.iter().enumerate() {
+        lines.push(format!("  -map [v{index}out] -map a:0 \\"));
+        lines.push(format!(
+            "  -c:v:{index} {video_encoder} -profile:v:{index} {profile} \\"
+        ));
+
+        if let Some((argument_name, argument_value)) = preset_argument.as_ref() {
+            lines.push(format!("  -{argument_name}:v:{index} {argument_value} \\"));
+        }
+
+        lines.push(format!(
+            "  -b:v:{index} {}k -maxrate:v:{index} {}k -bufsize:v:{index} {}k \\",
+            variant.video_bitrate_k, variant.maxrate_k, variant.bufsize_k
+        ));
+        lines.push(format!(
+            "  -g:v:{index} {} -keyint_min:v:{index} {} \\",
+            form.gop, form.gop
+        ));
+
+        if matches!(
+            form.video_codec_lib,
+            VideoCodecLib::X264 | VideoCodecLib::X265
+        ) {
+            lines.push(format!(
+                "  -sc_threshold:v:{index} {} \\",
+                form.sc_threshold
+            ));
+        }
+
+        lines.push(format!(
+            "  -c:a:{index} {audio_encoder} -b:a:{index} {}k -ac:a:{index} {} \\",
+            variant.audio_bitrate_k, form.audio_channels
+        ));
+    }
+
+    lines.push("  -pix_fmt yuv420p \\".to_string());
+    lines.push("  -f hls \\".to_string());
+    lines.push(format!("  -hls_time {} \\", form.hls_time_seconds));
+
+    if let Some(playlist_type_value) = ffmpeg_playlist_type(form.hls_playlist_type) {
+        lines.push(format!("  -hls_playlist_type {playlist_type_value} \\"));
+    }
+
+    if form.hls_flags_independent_segments {
+        lines.push("  -hls_flags independent_segments \\".to_string());
+    }
+
+    lines.push(format!(
+        "  -hls_segment_filename {} \\",
+        sh_quote(&segment_filename.to_string_lossy())
+    ));
+    lines.push(format!(
+        "  -master_pl_name {} \\",
+        sh_quote(&master_playlist_name)
+    ));
+    lines.push(format!(
+        "  -var_stream_map {} \\",
+        sh_quote(&var_stream_map)
+    ));
+    lines.push(format!("{}", sh_quote(&variant_playlist.to_string_lossy())));
+
+    lines.join("\n")
+}
+
+fn ffmpeg_script_popup_markdown(script: &str) -> String {
+    format!("```bash\n{script}\n```")
 }
 
 fn parse_u32(value: &str) -> Option<u32> {
@@ -432,4 +579,104 @@ fn video_stem(path: &Path) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn output_root_folder(form: &EncodeOptionsForm) -> PathBuf {
+    let base_folder = non_empty(&form.output_base_folder).unwrap_or_else(|| ".".to_string());
+    let mut output_root = PathBuf::from(base_folder);
+
+    if let Some(subfolder_name) = non_empty(&form.output_subfolder_name) {
+        output_root.push(subfolder_name);
+    }
+
+    output_root
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn video_encoder_name(codec: VideoCodecLib) -> &'static str {
+    match codec {
+        VideoCodecLib::X264 => "libx264",
+        VideoCodecLib::X265 => "libx265",
+        VideoCodecLib::Vp9 => "libvpx-vp9",
+        VideoCodecLib::Av1 => "libaom-av1",
+    }
+}
+
+fn audio_encoder_name(codec: AudioCodec) -> &'static str {
+    match codec {
+        AudioCodec::Aac => "aac",
+        AudioCodec::Opus => "libopus",
+        AudioCodec::Mp3 => "libmp3lame",
+    }
+}
+
+fn ffmpeg_profile_value(codec: VideoCodecLib, profile: VideoProfile) -> String {
+    match codec {
+        VideoCodecLib::Vp9 => match profile {
+            VideoProfile::Profile0 => "0".to_string(),
+            VideoProfile::Profile1 => "1".to_string(),
+            VideoProfile::Profile2 => "2".to_string(),
+            VideoProfile::Profile3 => "3".to_string(),
+            _ => "0".to_string(),
+        },
+        _ => profile.to_string(),
+    }
+}
+
+fn codec_preset_argument(codec: VideoCodecLib, preset: X264Preset) -> Option<(String, String)> {
+    let value = preset.to_string();
+
+    match codec {
+        VideoCodecLib::X264 | VideoCodecLib::X265 => Some(("preset".to_string(), value)),
+        VideoCodecLib::Vp9 => Some(("deadline".to_string(), value)),
+        VideoCodecLib::Av1 => {
+            let cpu_used = match preset {
+                X264Preset::Fast => "8",
+                X264Preset::Medium => "5",
+                X264Preset::Slow => "3",
+                _ => "5",
+            };
+            Some(("cpu-used".to_string(), cpu_used.to_string()))
+        }
+    }
+}
+
+fn ffmpeg_playlist_type(value: HlsPlaylistType) -> Option<&'static str> {
+    match value {
+        HlsPlaylistType::Vod => Some("vod"),
+        HlsPlaylistType::Event => Some("event"),
+        HlsPlaylistType::Live => None,
+    }
+}
+
+fn sanitize_variant_name(value: &str, index: usize) -> String {
+    let candidate = value.trim();
+    let source = if candidate.is_empty() {
+        format!("variant{}", index + 1)
+    } else {
+        candidate.to_string()
+    };
+
+    source
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }

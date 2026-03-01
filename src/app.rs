@@ -2,6 +2,7 @@ use crate::ff_helpers::{PreviewVideo, VideoMetadata};
 use crate::message::*;
 use crate::views;
 
+use iced::widget::markdown;
 use iced::{Element, Task, Theme};
 use std::fmt;
 
@@ -384,6 +385,7 @@ pub(crate) struct HLSenpai {
     pub video: Option<PreviewVideo>,
     pub state: AppState,
     pub encode_options: Option<EncodeOptionsForm>,
+    pub ffmpeg_script_popup: Option<markdown::Content>,
 }
 
 impl HLSenpai {

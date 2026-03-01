@@ -1,10 +1,10 @@
 use crate::app::{AudioCodec, HLSenpai, HlsPlaylistType, VideoCodecLib};
 use crate::message::Message;
 use iced::widget::{
-    button, checkbox, column, container, markdown, pick_list, row, scrollable, slider, text,
+    button, checkbox, column, container, markdown, pick_list, row, scrollable, slider, stack, text,
     text_input,
 };
-use iced::{Alignment, Element, Length};
+use iced::{Alignment, Background, Element, Length};
 use iced_video_player::VideoPlayer;
 
 type El<'a> = Element<'a, Message>;
@@ -431,7 +431,7 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                 .map(|fps| format!("{fps:.3}"))
                 .unwrap_or_else(|| "Unknown".to_string());
 
-            let content = column![
+            let base_content = column![
                 row![
                     button("Back")
                         .on_press(Message::BackToVideoOverview)
@@ -446,6 +446,8 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                         ))
                     ]
                     .spacing(4)
+                    .width(Length::Fill),
+                    button("Print ffmpeg Script").on_press(Message::PrintFfmpegScript)
                 ]
                 .spacing(14)
                 .align_y(Alignment::Center),
@@ -466,11 +468,60 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
             .width(Length::Fill)
             .height(Length::Fill);
 
-            container(content)
+            let base_layer = container(base_content)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .padding(iced::Padding::new(16.0))
-                .into()
+                .padding(iced::Padding::new(16.0));
+
+            if let Some(script_popup) = app.ffmpeg_script_popup.as_ref() {
+                let popup_content = column![
+                    row![
+                        text("Generated ffmpeg script").size(24).width(Length::Fill),
+                        button("Close").on_press(Message::CloseFfmpegScriptPopup)
+                    ]
+                    .align_y(Alignment::Center),
+                    scrollable(
+                        markdown::view(script_popup.items(), iced::Theme::TokyoNightStorm)
+                            .map(Message::MarkdownLinkClicked)
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                ]
+                .spacing(14)
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+                let popup_layer = container(
+                    container(popup_content)
+                        .padding(16)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .max_width(920)
+                        .max_height(620)
+                        .style(iced::widget::container::rounded_box),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(iced::Padding::new(24.0))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|theme: &iced::Theme| {
+                    let mut overlay = theme.extended_palette().background.base.color;
+                    overlay.a = 0.65;
+
+                    iced::widget::container::Style {
+                        background: Some(Background::Color(overlay)),
+                        ..iced::widget::container::Style::default()
+                    }
+                });
+
+                stack![base_layer, popup_layer]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                base_layer.into()
+            }
         }
         _ => container(
             column![
