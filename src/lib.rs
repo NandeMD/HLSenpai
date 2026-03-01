@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod ff_helpers;
 mod message;
 mod views;

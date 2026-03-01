@@ -116,12 +116,11 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
                 )
             };
 
-            let metadata_panel = container(
-                scrollable(metadata_sections_row)
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        iced::widget::scrollable::Scrollbar::default(),
-                    )),
-            )
+            let metadata_panel = container(scrollable(metadata_sections_row).direction(
+                iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::default(),
+                ),
+            ))
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(iced::Padding::new(14.0));

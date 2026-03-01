@@ -2,6 +2,7 @@ use crate::app::{
     AppState, AudioCodec, EncodeOptionsForm, EncodeProgress, EncodeRuntimeState, EncodeStatus,
     EncodeWorkerEvent, HLSenpai, HlsPlaylistType, VideoCodecLib, VideoProfile, X264Preset,
 };
+use crate::config::apply_preset_to_form;
 use crate::ff_helpers::{
     PreviewVideo, extract_video_metadata, validate_video_file, video_metadata_markdown_sections,
 };
@@ -65,6 +66,8 @@ pub(crate) enum Message {
 }
 
 pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Message> {
+    let mut should_persist_preset = false;
+
     match message {
         Message::SelectFilePressed => {
             app.ffmpeg_script_popup = None;
@@ -100,10 +103,11 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                                 return Task::none();
                             }
                         };
-                        let metadata_markdown_sections = video_metadata_markdown_sections(&metadata)
-                            .into_iter()
-                            .map(|section| markdown::Content::parse(&section))
-                            .collect::<Vec<_>>();
+                        let metadata_markdown_sections =
+                            video_metadata_markdown_sections(&metadata)
+                                .into_iter()
+                                .map(|section| markdown::Content::parse(&section))
+                                .collect::<Vec<_>>();
 
                         let video_url = match url::Url::from_file_path(&path) {
                             Ok(url) => url,
@@ -184,6 +188,9 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
             if let Some(video) = app.video.as_ref() {
                 if app.encode_options.is_none() {
                     let mut form = EncodeOptionsForm::from_metadata(&video.metadata);
+                    if let Some(saved_preset) = app.last_preset.as_ref() {
+                        apply_preset_to_form(&mut form, saved_preset);
+                    }
                     if let Some(stem) = video_stem(&video._path) {
                         form.output_subfolder_name = stem;
                     }
@@ -257,6 +264,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 && let Some(parsed) = parse_u32(&value)
             {
                 form.set_scale_width(parsed.max(1));
+                should_persist_preset = true;
             }
         }
         Message::EncodeScaleHeightChanged(value) => {
@@ -264,11 +272,13 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 && let Some(parsed) = parse_u32(&value)
             {
                 form.set_scale_height(parsed.max(1));
+                should_persist_preset = true;
             }
         }
         Message::EncodeScaleLockToggled(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.set_scale_lock_aspect(value);
+                should_persist_preset = true;
             }
         }
         Message::EncodeGopChanged(value) => {
@@ -276,21 +286,25 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 && let Some(parsed) = parse_u32(&value)
             {
                 form.gop = parsed.max(1);
+                should_persist_preset = true;
             }
         }
         Message::EncodeVideoCodecLibSelected(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.apply_codec_defaults(value);
+                should_persist_preset = true;
             }
         }
         Message::EncodeProfileSelected(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.profile = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodePresetSelected(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.preset = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeScThresholdChanged(value) => {
@@ -298,11 +312,13 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 && let Some(parsed) = parse_i32(&value)
             {
                 form.sc_threshold = parsed.max(0);
+                should_persist_preset = true;
             }
         }
         Message::EncodeAudioCodecSelected(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.audio_codec = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeAudioChannelsChanged(value) => {
@@ -310,6 +326,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 && let Some(parsed) = parse_u8(&value)
             {
                 form.audio_channels = parsed.max(1);
+                should_persist_preset = true;
             }
         }
         Message::EncodeHlsTimeChanged(value) => {
@@ -317,46 +334,55 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 && let Some(parsed) = parse_u32(&value)
             {
                 form.hls_time_seconds = parsed.max(1);
+                should_persist_preset = true;
             }
         }
         Message::EncodePlaylistTypeSelected(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.hls_playlist_type = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeIndependentSegmentsToggled(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.hls_flags_independent_segments = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeMasterPlaylistNameChanged(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.master_playlist_name = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeSegmentPatternChanged(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.segment_filename_pattern = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeOutputPlaylistPatternChanged(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.output_variant_playlist_pattern = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeOutputBaseFolderChanged(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.output_base_folder = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeOutputSubfolderChanged(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.output_subfolder_name = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeOutputMasterPlaylistFileChanged(value) => {
             if let Some(form) = app.encode_options.as_mut() {
                 form.output_master_playlist_file = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodePickOutputBaseFolderPressed => {
@@ -366,6 +392,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     .pick_folder()
             {
                 form.output_base_folder = path.display().to_string();
+                should_persist_preset = true;
             }
         }
         Message::EncodePickOutputMasterPlaylistFilePressed => {
@@ -387,6 +414,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     {
                         form.output_base_folder = parent.display().to_string();
                     }
+                    should_persist_preset = true;
                 }
             }
         }
@@ -397,6 +425,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 .and_then(|form| form.variants.get_mut(index))
             {
                 variant.name = value;
+                should_persist_preset = true;
             }
         }
         Message::EncodeVariantVideoBitrateChanged(index, value) => {
@@ -407,6 +436,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     .and_then(|form| form.variants.get_mut(index))
             {
                 variant.video_bitrate_k = parsed.max(1);
+                should_persist_preset = true;
             }
         }
         Message::EncodeVariantMaxrateChanged(index, value) => {
@@ -417,6 +447,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     .and_then(|form| form.variants.get_mut(index))
             {
                 variant.maxrate_k = parsed.max(1);
+                should_persist_preset = true;
             }
         }
         Message::EncodeVariantBufsizeChanged(index, value) => {
@@ -427,6 +458,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     .and_then(|form| form.variants.get_mut(index))
             {
                 variant.bufsize_k = parsed.max(1);
+                should_persist_preset = true;
             }
         }
         Message::EncodeVariantAudioBitrateChanged(index, value) => {
@@ -437,6 +469,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     .and_then(|form| form.variants.get_mut(index))
             {
                 variant.audio_bitrate_k = parsed.max(1);
+                should_persist_preset = true;
             }
         }
         Message::EncodePressed => {
@@ -468,6 +501,8 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                     sender,
                     Arc::clone(&cancel_flag),
                 );
+
+                should_persist_preset = true;
             }
         }
         Message::EncodeCancelPressed => {
@@ -529,6 +564,10 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
         Message::CloseFfmpegScriptPopup => {
             app.ffmpeg_script_popup = None;
         }
+    }
+
+    if should_persist_preset {
+        app.persist_last_preset();
     }
 
     Task::none()

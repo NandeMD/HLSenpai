@@ -1,9 +1,14 @@
+use crate::config::{
+    AppAuthConfig, ConfigPaths, PersistedEncodePreset, load_auth_config, load_last_preset,
+    save_auth_config, save_last_preset,
+};
 use crate::ff_helpers::{PreviewVideo, VideoMetadata};
 use crate::message::*;
 use crate::views;
 
 use iced::widget::markdown;
 use iced::{Element, Subscription, Task, Theme};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -18,7 +23,8 @@ pub(crate) enum AppState {
     EncodeOptions,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum VideoProfile {
     Baseline,
     Main,
@@ -62,7 +68,8 @@ impl fmt::Display for VideoProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum VideoCodecLib {
     #[default]
     X264,
@@ -128,7 +135,8 @@ impl fmt::Display for VideoCodecLib {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum X264Preset {
     Ultrafast,
     Superfast,
@@ -180,7 +188,8 @@ impl fmt::Display for X264Preset {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum AudioCodec {
     #[default]
     Aac,
@@ -202,7 +211,8 @@ impl fmt::Display for AudioCodec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum HlsPlaylistType {
     #[default]
     Vod,
@@ -224,7 +234,7 @@ impl fmt::Display for HlsPlaylistType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VariantForm {
     pub name: String,
     pub video_bitrate_k: u32,
@@ -234,7 +244,7 @@ pub(crate) struct VariantForm {
 }
 
 impl VariantForm {
-    fn defaults() -> [Self; 3] {
+    pub(crate) fn defaults() -> [Self; 3] {
         [
             Self {
                 name: "low".to_string(),
@@ -475,7 +485,6 @@ impl EncodeRuntimeState {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct HLSenpai {
     pub video: Option<PreviewVideo>,
     pub state: AppState,
@@ -483,11 +492,58 @@ pub(crate) struct HLSenpai {
     pub ffmpeg_script_popup: Option<markdown::Content>,
     pub encode_runtime: Option<EncodeRuntimeState>,
     pub show_encode_log_modal: bool,
+    pub config_paths: ConfigPaths,
+    pub _auth_config: AppAuthConfig,
+    pub last_preset: Option<PersistedEncodePreset>,
+}
+
+impl Default for HLSenpai {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HLSenpai {
     pub(crate) fn new() -> Self {
-        Self::default()
+        let config_paths = ConfigPaths::discover().unwrap_or_else(|err| {
+            eprintln!(
+                "Could not resolve OS config directory ({}). Falling back to current directory.",
+                err
+            );
+            ConfigPaths::fallback_current_dir()
+        });
+
+        let auth_config = match load_auth_config(&config_paths) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("Could not load auth config: {}. Using defaults.", err);
+                AppAuthConfig::default()
+            }
+        };
+
+        if let Err(err) = save_auth_config(&config_paths, &auth_config) {
+            eprintln!("Could not persist auth config bootstrap file: {}", err);
+        }
+
+        let last_preset = match load_last_preset(&config_paths) {
+            Ok(preset) => preset,
+            Err(err) => {
+                eprintln!("Could not load last encoding preset: {}. Ignoring.", err);
+                None
+            }
+        };
+
+        Self {
+            video: None,
+            state: AppState::Initial,
+            encode_options: None,
+            ffmpeg_script_popup: None,
+            encode_runtime: None,
+            show_encode_log_modal: false,
+            config_paths,
+            _auth_config: auth_config,
+            last_preset,
+        }
     }
 
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
@@ -516,6 +572,22 @@ impl HLSenpai {
 
     pub(crate) fn theme(&self) -> Theme {
         Theme::TokyoNightStorm
+    }
+
+    pub(crate) fn persist_last_preset(&mut self) {
+        let Some(form) = self.encode_options.as_ref() else {
+            return;
+        };
+
+        let preset = PersistedEncodePreset::from_form(form);
+        match save_last_preset(&self.config_paths, &preset) {
+            Ok(()) => {
+                self.last_preset = Some(preset);
+            }
+            Err(err) => {
+                eprintln!("Could not save last encoding preset: {}", err);
+            }
+        }
     }
 }
 
