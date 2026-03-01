@@ -1,11 +1,12 @@
-use crate::app::{AudioCodec, HLSenpai, HlsPlaylistType, VideoCodecLib};
+use crate::app::{AudioCodec, EncodeRuntimeState, HLSenpai, HlsPlaylistType, VideoCodecLib};
 use crate::message::Message;
 use iced::widget::{
-    button, checkbox, column, container, markdown, pick_list, row, scrollable, slider, stack, text,
-    text_input,
+    button, checkbox, column, container, markdown, pick_list, progress_bar, row, scrollable,
+    slider, stack, text, text_input,
 };
 use iced::{Alignment, Background, Element, Length};
 use iced_video_player::VideoPlayer;
+use std::time::Duration;
 
 type El<'a> = Element<'a, Message>;
 
@@ -139,6 +140,10 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
 pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
     let content: El<'_> = match (app.video.as_ref(), app.encode_options.as_ref()) {
         (Some(video), Some(form)) => {
+            let is_encode_running = app
+                .encode_runtime
+                .as_ref()
+                .is_some_and(EncodeRuntimeState::is_running);
             let scale_width = form.scale_width.to_string();
             let scale_height = form.scale_height.to_string();
             let gop = form.gop.to_string();
@@ -431,26 +436,48 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                 .map(|fps| format!("{fps:.3}"))
                 .unwrap_or_else(|| "Unknown".to_string());
 
-            let base_content = column![
-                row![
-                    button("Back")
-                        .on_press(Message::BackToVideoOverview)
-                        .width(100.0),
-                    column![
-                        text("Encode Options").size(30),
-                        text(format!(
-                            "Source: {} ({}) | FPS: {}",
-                            form.source_resolution_label(),
-                            form.source_aspect_label(),
-                            fps_text
-                        ))
-                    ]
-                    .spacing(4)
-                    .width(Length::Fill),
-                    button("Print ffmpeg Script").on_press(Message::PrintFfmpegScript)
+            let back_button = if is_encode_running {
+                button("Back").width(100.0)
+            } else {
+                button("Back")
+                    .on_press(Message::BackToVideoOverview)
+                    .width(100.0)
+            };
+
+            let encode_button = if is_encode_running {
+                button("Encode").style(iced::widget::button::danger)
+            } else {
+                button("Encode")
+                    .style(iced::widget::button::danger)
+                    .on_press(Message::EncodePressed)
+            };
+
+            let mut header = row![
+                back_button,
+                column![
+                    text("Encode Options").size(30),
+                    text(format!(
+                        "Source: {} ({}) | FPS: {}",
+                        form.source_resolution_label(),
+                        form.source_aspect_label(),
+                        fps_text
+                    ))
                 ]
-                .spacing(14)
-                .align_y(Alignment::Center),
+                .spacing(4)
+                .width(Length::Fill),
+                encode_button,
+                button("Print ffmpeg Script").on_press(Message::PrintFfmpegScript)
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center);
+
+            if app.encode_runtime.is_some() && !app.show_encode_log_modal {
+                header =
+                    header.push(button("Show Encode Log").on_press(Message::EncodeLogModalOpen));
+            }
+
+            let base_content = column![
+                header,
                 scrollable(
                     column![
                         scale_section,
@@ -472,6 +499,8 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .padding(iced::Padding::new(16.0));
+
+            let mut layered: El<'_> = base_layer.into();
 
             if let Some(script_popup) = app.ffmpeg_script_popup.as_ref() {
                 let popup_content = column![
@@ -515,13 +544,106 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                     }
                 });
 
-                stack![base_layer, popup_layer]
+                layered = stack![layered, popup_layer]
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .into()
-            } else {
-                base_layer.into()
+                    .into();
             }
+
+            if app.show_encode_log_modal
+                && let Some(runtime) = app.encode_runtime.as_ref()
+            {
+                let progress_value = runtime.progress_percent.unwrap_or(0.0).clamp(0.0, 100.0);
+                let progress_label = runtime
+                    .progress_percent
+                    .map(|value| format!("{value:.1}%"))
+                    .unwrap_or_else(|| "Calculating...".to_string());
+                let out_time_label = runtime
+                    .last_out_time_ms
+                    .map(format_output_time)
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let elapsed_label = format_duration(runtime.started_at.elapsed());
+                let speed_label = runtime.speed.as_deref().unwrap_or("Unknown");
+                let bitrate_label = runtime.bitrate.as_deref().unwrap_or("Unknown");
+                let logs_text = if runtime.log_lines.is_empty() {
+                    "Waiting for ffmpeg output...".to_string()
+                } else {
+                    runtime.log_lines.join("\n")
+                };
+
+                let cancel_button = if runtime.can_cancel() {
+                    button("Cancel Encode")
+                        .style(iced::widget::button::danger)
+                        .on_press(Message::EncodeCancelPressed)
+                } else {
+                    button("Cancel Encode").style(iced::widget::button::danger)
+                };
+
+                let log_popup_content = column![
+                    row![
+                        text("Encode Output").size(24).width(Length::Fill),
+                        button("Close").on_press(Message::EncodeLogModalClose)
+                    ]
+                    .align_y(Alignment::Center),
+                    text(format!("Status: {}", runtime.status_label())).size(18),
+                    row![
+                        text(format!("Progress: {progress_label}")),
+                        text(format!("Elapsed: {elapsed_label}")),
+                        text(format!("Encoded time: {out_time_label}")),
+                        text(format!("Speed: {speed_label}")),
+                        text(format!("Bitrate: {bitrate_label}"))
+                    ]
+                    .spacing(14)
+                    .align_y(Alignment::Center),
+                    progress_bar(0.0..=100.0, progress_value),
+                    container(
+                        scrollable(text(logs_text).size(14))
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(10)
+                    .style(iced::widget::container::rounded_box),
+                    container(cancel_button)
+                        .width(Length::Fill)
+                        .align_x(iced::alignment::Horizontal::Right)
+                ]
+                .spacing(14)
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+                let log_popup_layer = container(
+                    container(log_popup_content)
+                        .padding(16)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .max_width(980)
+                        .max_height(700)
+                        .style(iced::widget::container::rounded_box),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(iced::Padding::new(24.0))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|theme: &iced::Theme| {
+                    let mut overlay = theme.extended_palette().background.base.color;
+                    overlay.a = 0.65;
+
+                    iced::widget::container::Style {
+                        background: Some(Background::Color(overlay)),
+                        ..iced::widget::container::Style::default()
+                    }
+                });
+
+                layered = stack![layered, log_popup_layer]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
+
+            layered
         }
         _ => container(
             column![
@@ -547,4 +669,25 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
 fn format_time(seconds: f64) -> String {
     let total_seconds = seconds.max(0.0) as u64;
     format!("{}:{:02}s", total_seconds / 60, total_seconds % 60)
+}
+
+fn format_output_time(out_time_ms: u64) -> String {
+    let total_seconds = out_time_ms / 1_000_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
 }

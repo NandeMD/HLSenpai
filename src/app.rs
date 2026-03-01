@@ -3,8 +3,12 @@ use crate::message::*;
 use crate::views;
 
 use iced::widget::markdown;
-use iced::{Element, Task, Theme};
+use iced::{Element, Subscription, Task, Theme};
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 pub(crate) enum AppState {
@@ -380,12 +384,105 @@ impl EncodeOptionsForm {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EncodeProgress {
+    pub out_time_ms: Option<u64>,
+    pub speed: Option<String>,
+    pub bitrate: Option<String>,
+    pub progress_marker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EncodeWorkerEvent {
+    Started,
+    LogLine(String),
+    Progress(EncodeProgress),
+    Finished {
+        exit_code: Option<i32>,
+        was_canceled: bool,
+    },
+    SpawnError(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncodeStatus {
+    Running,
+    Canceling,
+    Success,
+    Failed,
+    Canceled,
+}
+
+pub(crate) struct EncodeRuntimeState {
+    pub status: EncodeStatus,
+    pub started_at: Instant,
+    pub progress_percent: Option<f32>,
+    pub last_out_time_ms: Option<u64>,
+    pub speed: Option<String>,
+    pub bitrate: Option<String>,
+    pub log_lines: Vec<String>,
+    pub receiver: Receiver<EncodeWorkerEvent>,
+    pub cancel_flag: Arc<AtomicBool>,
+    pub duration_ms: Option<u64>,
+}
+
+impl EncodeRuntimeState {
+    const MAX_LOG_LINES: usize = 2_000;
+
+    pub(crate) fn new(
+        receiver: Receiver<EncodeWorkerEvent>,
+        cancel_flag: Arc<AtomicBool>,
+        duration_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            status: EncodeStatus::Running,
+            started_at: Instant::now(),
+            progress_percent: None,
+            last_out_time_ms: None,
+            speed: None,
+            bitrate: None,
+            log_lines: Vec::new(),
+            receiver,
+            cancel_flag,
+            duration_ms,
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self.status, EncodeStatus::Running | EncodeStatus::Canceling)
+    }
+
+    pub(crate) fn can_cancel(&self) -> bool {
+        matches!(self.status, EncodeStatus::Running | EncodeStatus::Canceling)
+    }
+
+    pub(crate) fn append_log_line(&mut self, line: String) {
+        self.log_lines.push(line);
+        let overflow = self.log_lines.len().saturating_sub(Self::MAX_LOG_LINES);
+        if overflow > 0 {
+            self.log_lines.drain(0..overflow);
+        }
+    }
+
+    pub(crate) fn status_label(&self) -> &'static str {
+        match self.status {
+            EncodeStatus::Running => "Running",
+            EncodeStatus::Canceling => "Canceling",
+            EncodeStatus::Success => "Success",
+            EncodeStatus::Failed => "Failed",
+            EncodeStatus::Canceled => "Canceled",
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct HLSenpai {
     pub video: Option<PreviewVideo>,
     pub state: AppState,
     pub encode_options: Option<EncodeOptionsForm>,
     pub ffmpeg_script_popup: Option<markdown::Content>,
+    pub encode_runtime: Option<EncodeRuntimeState>,
+    pub show_encode_log_modal: bool,
 }
 
 impl HLSenpai {
@@ -395,6 +492,18 @@ impl HLSenpai {
 
     pub(crate) fn update(&mut self, message: Message) -> Task<Message> {
         handle_messages(self, message)
+    }
+
+    pub(crate) fn subscription(&self) -> Subscription<Message> {
+        if self
+            .encode_runtime
+            .as_ref()
+            .is_some_and(EncodeRuntimeState::is_running)
+        {
+            iced::time::every(Duration::from_millis(200)).map(|_| Message::EncodePollTick)
+        } else {
+            Subscription::none()
+        }
     }
 
     pub(crate) fn view(&self) -> Element<'_, Message> {

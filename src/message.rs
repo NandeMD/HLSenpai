@@ -1,6 +1,6 @@
 use crate::app::{
-    AppState, AudioCodec, EncodeOptionsForm, HLSenpai, HlsPlaylistType, VideoCodecLib,
-    VideoProfile, X264Preset,
+    AppState, AudioCodec, EncodeOptionsForm, EncodeProgress, EncodeRuntimeState, EncodeStatus,
+    EncodeWorkerEvent, HLSenpai, HlsPlaylistType, VideoCodecLib, VideoProfile, X264Preset,
 };
 use crate::ff_helpers::{
     PreviewVideo, extract_video_metadata, validate_video_file, video_metadata_markdown,
@@ -8,7 +8,13 @@ use crate::ff_helpers::{
 use iced::Task;
 use iced::widget::markdown;
 use iced_video_player::Video;
+use std::fs;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -49,6 +55,11 @@ pub(crate) enum Message {
     EncodeVariantMaxrateChanged(usize, String),
     EncodeVariantBufsizeChanged(usize, String),
     EncodeVariantAudioBitrateChanged(usize, String),
+    EncodePressed,
+    EncodeCancelPressed,
+    EncodePollTick,
+    EncodeLogModalOpen,
+    EncodeLogModalClose,
     PrintFfmpegScript,
     CloseFfmpegScriptPopup,
 }
@@ -57,6 +68,8 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
     match message {
         Message::SelectFilePressed => {
             app.ffmpeg_script_popup = None;
+            app.encode_runtime = None;
+            app.show_encode_log_modal = false;
 
             let selection = rfd::FileDialog::new()
                 .set_title("Select a video file")
@@ -178,6 +191,15 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
             }
         }
         Message::BackToVideoOverview => {
+            if app
+                .encode_runtime
+                .as_ref()
+                .is_some_and(EncodeRuntimeState::is_running)
+            {
+                eprintln!("Cannot navigate back while encoding is active.");
+                return Task::none();
+            }
+
             app.ffmpeg_script_popup = None;
 
             if app.video.is_some() {
@@ -415,9 +437,78 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 variant.audio_bitrate_k = parsed.max(1);
             }
         }
+        Message::EncodePressed => {
+            if app
+                .encode_runtime
+                .as_ref()
+                .is_some_and(EncodeRuntimeState::is_running)
+            {
+                return Task::none();
+            }
+
+            if let (Some(video), Some(form)) = (app.video.as_ref(), app.encode_options.as_ref()) {
+                let (sender, receiver) = mpsc::channel();
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                let duration_ms = seconds_to_ms(video.metadata.duration_seconds);
+                let has_audio = video.metadata.audio_codec.is_some();
+
+                app.encode_runtime = Some(EncodeRuntimeState::new(
+                    receiver,
+                    Arc::clone(&cancel_flag),
+                    duration_ms,
+                ));
+                app.show_encode_log_modal = true;
+
+                start_encode_worker(
+                    video._path.clone(),
+                    form.clone(),
+                    has_audio,
+                    sender,
+                    Arc::clone(&cancel_flag),
+                );
+            }
+        }
+        Message::EncodeCancelPressed => {
+            if let Some(runtime) = app.encode_runtime.as_mut()
+                && runtime.can_cancel()
+            {
+                runtime.status = EncodeStatus::Canceling;
+                runtime.cancel_flag.store(true, Ordering::Relaxed);
+                runtime.append_log_line("Cancellation requested...".to_string());
+            }
+        }
+        Message::EncodePollTick => {
+            if let Some(runtime) = app.encode_runtime.as_mut() {
+                let mut disconnected = false;
+
+                loop {
+                    match runtime.receiver.try_recv() {
+                        Ok(event) => apply_encode_worker_event(runtime, event),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if disconnected && runtime.is_running() {
+                    runtime.status = EncodeStatus::Failed;
+                    runtime
+                        .append_log_line("Encoding worker disconnected unexpectedly.".to_string());
+                }
+            }
+        }
+        Message::EncodeLogModalOpen => {
+            app.show_encode_log_modal = true;
+        }
+        Message::EncodeLogModalClose => {
+            app.show_encode_log_modal = false;
+        }
         Message::PrintFfmpegScript => {
             if let (Some(video), Some(form)) = (app.video.as_ref(), app.encode_options.as_ref()) {
-                let script = build_ffmpeg_script(&video._path, form);
+                let script =
+                    build_ffmpeg_script(&video._path, form, video.metadata.audio_codec.is_some());
                 let markdown_script = ffmpeg_script_popup_markdown(&script);
                 app.ffmpeg_script_popup = Some(markdown::Content::parse(&markdown_script));
             } else {
@@ -432,9 +523,241 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
     Task::none()
 }
 
-fn build_ffmpeg_script(input_path: &Path, form: &EncodeOptionsForm) -> String {
+fn apply_encode_worker_event(runtime: &mut EncodeRuntimeState, event: EncodeWorkerEvent) {
+    match event {
+        EncodeWorkerEvent::Started => {
+            runtime.append_log_line("ffmpeg process started.".to_string());
+        }
+        EncodeWorkerEvent::LogLine(line) => {
+            runtime.append_log_line(line);
+        }
+        EncodeWorkerEvent::Progress(progress) => {
+            if let Some(out_time_ms) = progress.out_time_ms {
+                runtime.last_out_time_ms = Some(out_time_ms);
+
+                if let Some(total_ms) = runtime.duration_ms
+                    && total_ms > 0
+                {
+                    let percent = (out_time_ms as f64 / total_ms as f64 * 100.0).clamp(0.0, 100.0);
+                    runtime.progress_percent = Some(percent as f32);
+                }
+            }
+
+            if let Some(speed) = progress.speed {
+                runtime.speed = Some(speed);
+            }
+
+            if let Some(bitrate) = progress.bitrate {
+                runtime.bitrate = Some(bitrate);
+            }
+
+            if progress.progress_marker.as_deref() == Some("end") {
+                runtime.progress_percent = Some(100.0);
+            }
+        }
+        EncodeWorkerEvent::Finished {
+            exit_code,
+            was_canceled,
+        } => {
+            if was_canceled {
+                runtime.status = EncodeStatus::Canceled;
+                runtime.append_log_line("Encode canceled.".to_string());
+            } else if exit_code == Some(0) {
+                runtime.status = EncodeStatus::Success;
+                runtime.progress_percent = Some(100.0);
+                runtime.append_log_line("Encode completed successfully.".to_string());
+            } else {
+                runtime.status = EncodeStatus::Failed;
+                runtime.append_log_line(format!(
+                    "Encode failed with exit code: {}",
+                    exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+        }
+        EncodeWorkerEvent::SpawnError(message) => {
+            runtime.status = EncodeStatus::Failed;
+            runtime.append_log_line(format!("Could not start ffmpeg: {message}"));
+        }
+    }
+}
+
+fn start_encode_worker(
+    input_path: PathBuf,
+    form: EncodeOptionsForm,
+    has_audio: bool,
+    sender: mpsc::Sender<EncodeWorkerEvent>,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    thread::spawn(move || run_encode_worker(input_path, form, has_audio, sender, cancel_flag));
+}
+
+fn run_encode_worker(
+    input_path: PathBuf,
+    form: EncodeOptionsForm,
+    has_audio: bool,
+    sender: mpsc::Sender<EncodeWorkerEvent>,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    let (output_root, args) = build_ffmpeg_args(&input_path, &form, has_audio);
+
+    if let Err(err) = fs::create_dir_all(&output_root) {
+        let _ = sender.send(EncodeWorkerEvent::SpawnError(format!(
+            "Could not create output folder {}: {err}",
+            output_root.display()
+        )));
+        return;
+    }
+
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = sender.send(EncodeWorkerEvent::SpawnError(err.to_string()));
+            return;
+        }
+    };
+
+    let _ = sender.send(EncodeWorkerEvent::Started);
+    if !has_audio {
+        let _ = sender.send(EncodeWorkerEvent::LogLine(
+            "Input has no audio stream. Encoding video-only renditions.".to_string(),
+        ));
+    }
+
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        let tx = sender.clone();
+        thread::spawn(move || read_progress_output(stdout, tx))
+    });
+
+    let stderr_handle = child.stderr.take().map(|stderr| {
+        let tx = sender.clone();
+        thread::spawn(move || read_stderr_output(stderr, tx))
+    });
+
+    let mut was_canceled = false;
+    let mut cancel_sent = false;
+
+    let exit_code = loop {
+        if cancel_flag.load(Ordering::Relaxed) && !cancel_sent {
+            cancel_sent = true;
+            was_canceled = true;
+
+            if let Err(err) = child.kill()
+                && err.kind() != ErrorKind::InvalidInput
+            {
+                let _ = sender.send(EncodeWorkerEvent::LogLine(format!(
+                    "Failed to terminate ffmpeg process: {err}"
+                )));
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {
+                thread::sleep(Duration::from_millis(120));
+            }
+            Err(err) => {
+                let _ = sender.send(EncodeWorkerEvent::LogLine(format!(
+                    "Error while waiting for ffmpeg process: {err}"
+                )));
+                break None;
+            }
+        }
+    };
+
+    if let Some(handle) = stdout_handle {
+        let _ = handle.join();
+    }
+    if let Some(handle) = stderr_handle {
+        let _ = handle.join();
+    }
+
+    let _ = sender.send(EncodeWorkerEvent::Finished {
+        exit_code,
+        was_canceled,
+    });
+}
+
+fn read_progress_output(stdout: ChildStdout, sender: mpsc::Sender<EncodeWorkerEvent>) {
+    let reader = BufReader::new(stdout);
+    let mut snapshot = EncodeProgress::default();
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(err) => {
+                let _ = sender.send(EncodeWorkerEvent::LogLine(format!(
+                    "Error reading ffmpeg progress: {err}"
+                )));
+                break;
+            }
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let _ = sender.send(EncodeWorkerEvent::LogLine(format!("[progress] {trimmed}")));
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+
+        match key {
+            "out_time_ms" => {
+                if let Ok(parsed) = value.parse::<u64>() {
+                    snapshot.out_time_ms = Some(parsed);
+                }
+            }
+            "speed" => {
+                snapshot.speed = Some(value.to_string());
+            }
+            "bitrate" => {
+                snapshot.bitrate = Some(value.to_string());
+            }
+            "progress" => {
+                snapshot.progress_marker = Some(value.to_string());
+                let _ = sender.send(EncodeWorkerEvent::Progress(snapshot.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn read_stderr_output(stderr: ChildStderr, sender: mpsc::Sender<EncodeWorkerEvent>) {
+    let reader = BufReader::new(stderr);
+
+    for line_result in reader.lines() {
+        match line_result {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    let _ = sender.send(EncodeWorkerEvent::LogLine(line));
+                }
+            }
+            Err(err) => {
+                let _ = sender.send(EncodeWorkerEvent::LogLine(format!(
+                    "Error reading ffmpeg stderr: {err}"
+                )));
+                break;
+            }
+        }
+    }
+}
+
+fn build_ffmpeg_args(
+    input_path: &Path,
+    form: &EncodeOptionsForm,
+    has_audio: bool,
+) -> (PathBuf, Vec<String>) {
     let output_root = output_root_folder(form);
-    let output_root_string = output_root.to_string_lossy().to_string();
     let segment_pattern =
         non_empty(&form.segment_filename_pattern).unwrap_or_else(|| "v%v/seg_%06d.ts".to_string());
     let variant_playlist_pattern = non_empty(&form.output_variant_playlist_pattern)
@@ -476,83 +799,123 @@ fn build_ffmpeg_script(input_path: &Path, form: &EncodeOptionsForm) -> String {
         .iter()
         .enumerate()
         .map(|(index, variant)| {
-            format!(
-                "v:{index},a:{index},name:{}",
-                sanitize_variant_name(&variant.name, index)
-            )
+            if has_audio {
+                format!(
+                    "v:{index},a:{index},name:{}",
+                    sanitize_variant_name(&variant.name, index)
+                )
+            } else {
+                format!(
+                    "v:{index},name:{}",
+                    sanitize_variant_name(&variant.name, index)
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join(" ");
 
-    let mut lines = vec![
-        "#!/usr/bin/env bash".to_string(),
-        "set -euo pipefail".to_string(),
-        format!("mkdir -p {}", sh_quote(&output_root_string)),
-        "ffmpeg -y \\".to_string(),
-        format!("  -i {} \\", sh_quote(&input_path.to_string_lossy())),
-        format!("  -filter_complex {} \\", sh_quote(&filter_complex)),
+    let mut args = vec![
+        "-y".to_string(),
+        "-i".to_string(),
+        input_path.to_string_lossy().to_string(),
+        "-filter_complex".to_string(),
+        filter_complex,
     ];
 
     for (index, variant) in form.variants.iter().enumerate() {
-        lines.push(format!("  -map [v{index}out] -map a:0 \\"));
-        lines.push(format!(
-            "  -c:v:{index} {video_encoder} -profile:v:{index} {profile} \\"
-        ));
-
-        if let Some((argument_name, argument_value)) = preset_argument.as_ref() {
-            lines.push(format!("  -{argument_name}:v:{index} {argument_value} \\"));
+        args.push("-map".to_string());
+        args.push(format!("[v{index}out]"));
+        if has_audio {
+            args.push("-map".to_string());
+            args.push("a:0".to_string());
         }
 
-        lines.push(format!(
-            "  -b:v:{index} {}k -maxrate:v:{index} {}k -bufsize:v:{index} {}k \\",
-            variant.video_bitrate_k, variant.maxrate_k, variant.bufsize_k
-        ));
-        lines.push(format!(
-            "  -g:v:{index} {} -keyint_min:v:{index} {} \\",
-            form.gop, form.gop
-        ));
+        args.push(format!("-c:v:{index}"));
+        args.push(video_encoder.to_string());
+        args.push(format!("-profile:v:{index}"));
+        args.push(profile.clone());
+
+        if let Some((argument_name, argument_value)) = preset_argument.as_ref() {
+            args.push(format!("-{argument_name}:v:{index}"));
+            args.push(argument_value.clone());
+        }
+
+        args.push(format!("-b:v:{index}"));
+        args.push(format!("{}k", variant.video_bitrate_k));
+        args.push(format!("-maxrate:v:{index}"));
+        args.push(format!("{}k", variant.maxrate_k));
+        args.push(format!("-bufsize:v:{index}"));
+        args.push(format!("{}k", variant.bufsize_k));
+
+        args.push(format!("-g:v:{index}"));
+        args.push(form.gop.to_string());
+        args.push(format!("-keyint_min:v:{index}"));
+        args.push(form.gop.to_string());
 
         if matches!(
             form.video_codec_lib,
             VideoCodecLib::X264 | VideoCodecLib::X265
         ) {
-            lines.push(format!(
-                "  -sc_threshold:v:{index} {} \\",
-                form.sc_threshold
-            ));
+            args.push(format!("-sc_threshold:v:{index}"));
+            args.push(form.sc_threshold.to_string());
         }
 
-        lines.push(format!(
-            "  -c:a:{index} {audio_encoder} -b:a:{index} {}k -ac:a:{index} {} \\",
-            variant.audio_bitrate_k, form.audio_channels
-        ));
+        if has_audio {
+            args.push(format!("-c:a:{index}"));
+            args.push(audio_encoder.to_string());
+            args.push(format!("-b:a:{index}"));
+            args.push(format!("{}k", variant.audio_bitrate_k));
+            args.push(format!("-ac:a:{index}"));
+            args.push(form.audio_channels.to_string());
+        }
     }
 
-    lines.push("  -pix_fmt yuv420p \\".to_string());
-    lines.push("  -f hls \\".to_string());
-    lines.push(format!("  -hls_time {} \\", form.hls_time_seconds));
+    args.push("-pix_fmt".to_string());
+    args.push("yuv420p".to_string());
+    args.push("-f".to_string());
+    args.push("hls".to_string());
+    args.push("-hls_time".to_string());
+    args.push(form.hls_time_seconds.to_string());
 
     if let Some(playlist_type_value) = ffmpeg_playlist_type(form.hls_playlist_type) {
-        lines.push(format!("  -hls_playlist_type {playlist_type_value} \\"));
+        args.push("-hls_playlist_type".to_string());
+        args.push(playlist_type_value.to_string());
     }
 
     if form.hls_flags_independent_segments {
-        lines.push("  -hls_flags independent_segments \\".to_string());
+        args.push("-hls_flags".to_string());
+        args.push("independent_segments".to_string());
     }
 
-    lines.push(format!(
-        "  -hls_segment_filename {} \\",
-        sh_quote(&segment_filename.to_string_lossy())
-    ));
-    lines.push(format!(
-        "  -master_pl_name {} \\",
-        sh_quote(&master_playlist_name)
-    ));
-    lines.push(format!(
-        "  -var_stream_map {} \\",
-        sh_quote(&var_stream_map)
-    ));
-    lines.push(format!("{}", sh_quote(&variant_playlist.to_string_lossy())));
+    args.push("-hls_segment_filename".to_string());
+    args.push(segment_filename.to_string_lossy().to_string());
+    args.push("-master_pl_name".to_string());
+    args.push(master_playlist_name);
+    args.push("-var_stream_map".to_string());
+    args.push(var_stream_map);
+    args.push("-progress".to_string());
+    args.push("pipe:1".to_string());
+    args.push("-nostats".to_string());
+    args.push(variant_playlist.to_string_lossy().to_string());
+
+    (output_root, args)
+}
+
+fn build_ffmpeg_script(input_path: &Path, form: &EncodeOptionsForm, has_audio: bool) -> String {
+    let (output_root, args) = build_ffmpeg_args(input_path, form, has_audio);
+    let output_root_string = output_root.to_string_lossy().to_string();
+
+    let mut lines = vec![
+        "#!/usr/bin/env bash".to_string(),
+        "set -euo pipefail".to_string(),
+        format!("mkdir -p {}", sh_quote(&output_root_string)),
+        "ffmpeg \\".to_string(),
+    ];
+
+    for (index, argument) in args.iter().enumerate() {
+        let suffix = if index + 1 == args.len() { "" } else { " \\" };
+        lines.push(format!("  {}{suffix}", sh_quote(argument)));
+    }
 
     lines.join("\n")
 }
@@ -571,6 +934,15 @@ fn parse_u8(value: &str) -> Option<u8> {
 
 fn parse_i32(value: &str) -> Option<i32> {
     value.trim().parse::<i32>().ok()
+}
+
+fn seconds_to_ms(value: Option<f64>) -> Option<u64> {
+    let seconds = value?;
+    if seconds.is_finite() && seconds > 0.0 {
+        Some((seconds * 1000.0) as u64)
+    } else {
+        None
+    }
 }
 
 fn video_stem(path: &Path) -> Option<String> {

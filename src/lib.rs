@@ -10,5 +10,6 @@ pub fn run() -> iced::Result {
         app::HLSenpai::view,
     )
     .theme(app::HLSenpai::theme)
+    .subscription(app::HLSenpai::subscription)
     .run()
 }
