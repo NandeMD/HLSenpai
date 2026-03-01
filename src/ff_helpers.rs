@@ -214,61 +214,64 @@ fn gcd(mut left: u64, mut right: u64) -> u64 {
     left.max(1)
 }
 
-pub(crate) fn video_metadata_markdown(metadata: &VideoMetadata) -> String {
-    let mut markdown_text = format!(
-        "# Video Information\n\
-         \n\
-         ## Video\n\
-         - **Codec:** {}\n\
-         - **Resolution:** {}\n\
-         - **Aspect Ratio:** {}\n\
-         - **Frame Rate:** {}\n\
-         - **Bitrate:** {}\n\
-         - **Pixel Format:** {}\n\
-         \n\
-         ## Audio\n\
-         - **Codec:** {}\n\
-         - **Bitrate:** {}\n\
-         - **Sample Rate:** {}\n\
-         - **Channels:** {}\n\
-         - **Channel Layout:** {}\n\
-         \n\
-         ## Container\n\
-         - **Format:** {}\n\
-         - **Duration:** {}\n\
-         - **Overall Bitrate:** {}\n\
-         - **Tags:** {}\n",
-        metadata.video_codec.as_deref().unwrap_or("Unknown"),
-        metadata.video_resolution.as_deref().unwrap_or("Unknown"),
-        metadata.video_ratio.as_deref().unwrap_or("Unknown"),
-        format_framerate(metadata.framerate, metadata.framerate_ratio.as_deref()),
-        format_bitrate(metadata.video_bitrate),
-        metadata.video_pixel_format.as_deref().unwrap_or("Unknown"),
-        metadata.audio_codec.as_deref().unwrap_or("None"),
-        format_bitrate(metadata.audio_bitrate),
-        format_hz(metadata.audio_sample_rate),
-        metadata
-            .audio_channels
-            .map(|channels| channels.to_string())
-            .unwrap_or_else(|| "Unknown".to_string()),
-        metadata
-            .audio_channel_layout
-            .as_deref()
-            .unwrap_or("Unknown"),
-        metadata.container_format.as_deref().unwrap_or("Unknown"),
-        format_seconds(metadata.duration_seconds),
-        format_bitrate(metadata.overall_bitrate),
-        metadata.file_metadata.len(),
-    );
+pub(crate) fn video_metadata_markdown_sections(metadata: &VideoMetadata) -> Vec<String> {
+    let mut sections = vec![
+        format!(
+            "### Video\n\
+             - **Codec:** {}\n\
+             - **Resolution:** {}\n\
+             - **Aspect Ratio:** {}\n\
+             - **Frame Rate:** {}\n\
+             - **Bitrate:** {}\n\
+             - **Pixel Format:** {}\n",
+            metadata.video_codec.as_deref().unwrap_or("Unknown"),
+            metadata.video_resolution.as_deref().unwrap_or("Unknown"),
+            metadata.video_ratio.as_deref().unwrap_or("Unknown"),
+            format_framerate(metadata.framerate, metadata.framerate_ratio.as_deref()),
+            format_bitrate(metadata.video_bitrate),
+            metadata.video_pixel_format.as_deref().unwrap_or("Unknown"),
+        ),
+        format!(
+            "### Audio\n\
+             - **Codec:** {}\n\
+             - **Bitrate:** {}\n\
+             - **Sample Rate:** {}\n\
+             - **Channels:** {}\n\
+             - **Channel Layout:** {}\n",
+            metadata.audio_codec.as_deref().unwrap_or("None"),
+            format_bitrate(metadata.audio_bitrate),
+            format_hz(metadata.audio_sample_rate),
+            metadata
+                .audio_channels
+                .map(|channels| channels.to_string())
+                .unwrap_or_else(|| "Unknown".to_string()),
+            metadata
+                .audio_channel_layout
+                .as_deref()
+                .unwrap_or("Unknown"),
+        ),
+        format!(
+            "### Container\n\
+             - **Format:** {}\n\
+             - **Duration:** {}\n\
+             - **Overall Bitrate:** {}\n\
+             - **Tags:** {}\n",
+            metadata.container_format.as_deref().unwrap_or("Unknown"),
+            format_seconds(metadata.duration_seconds),
+            format_bitrate(metadata.overall_bitrate),
+            metadata.file_metadata.len(),
+        ),
+    ];
 
     if !metadata.file_metadata.is_empty() {
-        markdown_text.push_str("\n## Metadata Tags\n");
+        let mut tags_section = String::from("### Metadata Tags\n");
         for (key, value) in &metadata.file_metadata {
-            markdown_text.push_str(&format!("- **{key}:** {value}\n"));
+            tags_section.push_str(&format!("- **{key}:** {value}\n"));
         }
+        sections.push(tags_section);
     }
 
-    markdown_text
+    sections
 }
 
 fn format_seconds(seconds: Option<f64>) -> String {
@@ -302,7 +305,7 @@ pub struct PreviewVideo {
     pub _path: PathBuf,
     pub video: Video,
     pub metadata: VideoMetadata,
-    pub metadata_markdown: markdown::Content,
+    pub metadata_markdown_sections: Vec<markdown::Content>,
     pub position: f64,
     pub dragging: bool,
 }

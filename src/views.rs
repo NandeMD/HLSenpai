@@ -29,7 +29,7 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
             let duration_secs = video.video.duration().as_secs_f64();
             let slider_value = video.position.clamp(0.0, duration_secs);
 
-            let left_panel = column![
+            let video_panel = column![
                 text(format!(
                     "Video Preview ({})",
                     video
@@ -89,36 +89,55 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
             .width(Length::Fill)
             .height(Length::Fill);
 
-            let metadata_panel = container(scrollable(
-                markdown::view(
-                    video.metadata_markdown.items(),
-                    iced::Theme::TokyoNightStorm,
+            let header = container(button("Encode Options").on_press(Message::OpenEncodeOptions))
+                .width(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right);
+
+            let metadata_sections_row = if video.metadata_markdown_sections.is_empty() {
+                row![text("No video metadata available.")]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_y(Alignment::Center)
+            } else {
+                video.metadata_markdown_sections.iter().fold(
+                    row![].spacing(12).height(Length::Fill),
+                    |row, section| {
+                        let section_card = container(
+                            markdown::view(section.items(), iced::Theme::TokyoNightStorm)
+                                .map(Message::MarkdownLinkClicked),
+                        )
+                        .width(Length::Fixed(360.0))
+                        .height(Length::Fill)
+                        .padding(iced::Padding::new(12.0))
+                        .style(iced::widget::container::rounded_box);
+
+                        row.push(section_card)
+                    },
                 )
-                .map(Message::MarkdownLinkClicked),
-            ))
+            };
+
+            let metadata_panel = container(
+                scrollable(metadata_sections_row)
+                    .direction(iced::widget::scrollable::Direction::Horizontal(
+                        iced::widget::scrollable::Scrollbar::default(),
+                    )),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(iced::Padding::new(14.0));
 
-            let right_panel = column![
-                metadata_panel,
-                button("Encode Options")
-                    .on_press(Message::OpenEncodeOptions)
+            column![
+                container(header)
                     .width(Length::Fill)
+                    .padding(iced::Padding::new(12.0).right(14.0).top(8.0)),
+                container(video_panel)
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(3)),
+                container(metadata_panel)
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(2))
             ]
             .spacing(12)
-            .width(Length::Fill)
-            .height(Length::Fill);
-
-            row![
-                container(left_panel)
-                    .width(Length::FillPortion(3))
-                    .height(Length::Fill),
-                container(right_panel)
-                    .width(Length::FillPortion(2))
-                    .height(Length::Fill)
-            ]
-            .spacing(14)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

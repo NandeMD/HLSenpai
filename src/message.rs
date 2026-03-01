@@ -3,7 +3,7 @@ use crate::app::{
     EncodeWorkerEvent, HLSenpai, HlsPlaylistType, VideoCodecLib, VideoProfile, X264Preset,
 };
 use crate::ff_helpers::{
-    PreviewVideo, extract_video_metadata, validate_video_file, video_metadata_markdown,
+    PreviewVideo, extract_video_metadata, validate_video_file, video_metadata_markdown_sections,
 };
 use iced::Task;
 use iced::widget::markdown;
@@ -100,8 +100,10 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                                 return Task::none();
                             }
                         };
-                        let metadata_markdown_content =
-                            markdown::Content::parse(&video_metadata_markdown(&metadata));
+                        let metadata_markdown_sections = video_metadata_markdown_sections(&metadata)
+                            .into_iter()
+                            .map(|section| markdown::Content::parse(&section))
+                            .collect::<Vec<_>>();
 
                         let video_url = match url::Url::from_file_path(&path) {
                             Ok(url) => url,
@@ -130,7 +132,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                                     video,
                                     _path: path,
                                     metadata,
-                                    metadata_markdown: metadata_markdown_content,
+                                    metadata_markdown_sections,
                                     position: 0.0,
                                     dragging: false,
                                 })
