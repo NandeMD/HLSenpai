@@ -1,5 +1,4 @@
-use std::path::PathBuf;
-
+use crate::ff_helpers::PreviewVideo;
 use crate::message::*;
 use crate::views;
 
@@ -14,7 +13,7 @@ pub(crate) enum AppState {
 
 #[derive(Default)]
 pub(crate) struct HLSenpai {
-    pub video: Option<PathBuf>,
+    pub video: Option<PreviewVideo>,
     pub state: AppState,
 }
 

@@ -1,5 +1,6 @@
 use ffmpeg_next as ffmpeg;
-use std::path::Path;
+use iced_video_player::Video;
+use std::path::{Path, PathBuf};
 
 pub(crate) fn validate_video_file(path: &Path) -> Result<(), String> {
     ffmpeg::init().map_err(|err| format!("Failed to initialize ffmpeg: {err}"))?;
@@ -21,4 +22,11 @@ pub(crate) fn validate_video_file(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("No supported video decoder found for this stream: {err}"))?;
 
     Ok(())
+}
+
+pub struct PreviewVideo {
+    pub _path: PathBuf,
+    pub video: Video,
+    pub position: f64,
+    pub dragging: bool,
 }

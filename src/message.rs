@@ -1,10 +1,18 @@
 use crate::app::{AppState, HLSenpai};
-use crate::ff_helpers::validate_video_file;
+use crate::ff_helpers::{PreviewVideo, validate_video_file};
 use iced::Task;
+use iced_video_player::Video;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     SelectFilePressed,
+    TogglePause,
+    ToggleLoop,
+    Seek(f64),
+    SeekRelease,
+    EndOfStream,
+    NewFrame,
 }
 
 pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Message> {
@@ -21,9 +29,51 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
             app.video = match selection {
                 Some(path) => match validate_video_file(&path) {
                     Ok(()) => {
-                        println!("Selected file: {}", path.display());
-                        app.state = AppState::VideoOverview;
-                        Some(path)
+                        let video_url = match url::Url::from_file_path(&path) {
+                            Ok(url) => url,
+                            Err(()) => {
+                                let err_msg = format!(
+                                    "Could not convert file path to URL:\n{}",
+                                    path.display()
+                                );
+                                let _ = rfd::MessageDialog::new()
+                                    .set_title("File Path Error")
+                                    .set_description(&err_msg)
+                                    .set_buttons(rfd::MessageButtons::Ok)
+                                    .show();
+                                eprintln!("{err_msg}");
+                                app.state = AppState::Initial;
+                                return Task::none();
+                            }
+                        };
+
+                        match Video::new(&video_url) {
+                            Ok(video) => {
+                                println!("Selected file: {}", path.display());
+                                app.state = AppState::VideoOverview;
+                                Some(PreviewVideo {
+                                    video,
+                                    _path: path,
+                                    position: 0.0,
+                                    dragging: false,
+                                })
+                            }
+                            Err(err) => {
+                                let err_msg = format!(
+                                    "Could not load selected video:\n{}\nReason: {}",
+                                    path.display(),
+                                    err
+                                );
+                                let _ = rfd::MessageDialog::new()
+                                    .set_title("Video Load Failed")
+                                    .set_description(&err_msg)
+                                    .set_buttons(rfd::MessageButtons::Ok)
+                                    .show();
+                                eprintln!("{err_msg}");
+                                app.state = AppState::Initial;
+                                None
+                            }
+                        }
                     }
                     Err(reason) => {
                         let err_msg = format!(
@@ -37,14 +87,53 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                             .set_buttons(rfd::MessageButtons::Ok)
                             .show();
                         eprintln!("{err_msg}");
+                        app.state = AppState::Initial;
                         None
                     }
                 },
                 None => {
                     eprintln!("File selection cancelled");
+                    app.state = AppState::Initial;
                     None
                 }
             };
+        }
+        Message::TogglePause => {
+            if let Some(video) = app.video.as_mut() {
+                video.video.set_paused(!video.video.paused());
+            }
+        }
+        Message::ToggleLoop => {
+            if let Some(video) = app.video.as_mut() {
+                video.video.set_looping(!video.video.looping());
+            }
+        }
+        Message::Seek(seconds) => {
+            if let Some(video) = app.video.as_mut() {
+                video.dragging = true;
+                video.position = seconds;
+                video.video.set_paused(true);
+            }
+        }
+        Message::SeekRelease => {
+            if let Some(video) = app.video.as_mut() {
+                video.dragging = false;
+                if let Err(err) = video
+                    .video
+                    .seek(Duration::from_secs_f64(video.position), false)
+                {
+                    eprintln!("Could not seek video: {err}");
+                }
+                video.video.set_paused(false);
+            }
+        }
+        Message::EndOfStream => {
+            println!("End of stream reached");
+        }
+        Message::NewFrame => {
+            if let Some(video) = app.video.as_mut() && !video.dragging {
+                video.position = video.video.position().as_secs_f64();
+            }
         }
     }
 
