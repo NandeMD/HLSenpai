@@ -7,18 +7,53 @@ use iced::widget::{
     button, checkbox, column, container, markdown, opaque, pick_list, progress_bar, row,
     scrollable, slider, stack, text, text_input,
 };
-use iced::{Alignment, Background, Element, Length};
+use iced::{Alignment, Background, Border, Color, Element, Length};
 use iced_video_player::VideoPlayer;
+use std::path::Path;
 use std::time::Duration;
 
 type El<'a> = Element<'a, Message>;
 
 pub(crate) fn select_file(_app: &HLSenpai) -> El<'_> {
+    let drop_hint = drop_hint_text(_app, "Drop a video file here");
+    let support_text = if _app.supports_file_drop {
+        "or drag and drop a video file into this window"
+    } else {
+        "Drag and drop is unavailable on Wayland in the current iced build"
+    };
+    let drop_card = container(
+        column![
+            container(button("Select File").on_press(Message::SelectFilePressed))
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            container(text(support_text).size(16))
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            container(text(drop_hint_text_for_state(_app, drop_hint)).size(14))
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            row![
+                text_input("/path/to/video.mp4", &_app.video_path_input)
+                    .on_input(Message::VideoPathInputChanged)
+                    .on_submit(Message::VideoPathLoadPressed)
+                    .width(Length::Fill),
+                button("Load Path").on_press(Message::VideoPathLoadPressed)
+            ]
+            .spacing(10)
+            .width(Length::Fill)
+        ]
+        .spacing(16)
+        .width(Length::Fill)
+        .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .max_width(560)
+    .padding(iced::Padding::new(28.0))
+    .style(drop_target_style(_app.hovered_drop_file.is_some()));
+
     let content = column![
         container(
-            column![button("Select File").on_press(Message::SelectFilePressed),]
-                .spacing(16)
-                .align_x(Alignment::Center)
+            drop_card
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -102,9 +137,30 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
             .width(Length::Fill)
             .height(Length::Fill);
 
-            let header = container(button("Encode Options").on_press(Message::OpenEncodeOptions))
+            let replace_help = if app.supports_file_drop {
+                "Drag and drop a new video anywhere on this page to replace the current file."
+            } else {
+                "Wayland session detected: drag and drop is unavailable in the current iced build."
+            };
+            let header = column![
+                row![
+                    text(replace_help).size(14).width(Length::Fill),
+                    button("Select File").on_press(Message::SelectFilePressed),
+                    button("Encode Options").on_press(Message::OpenEncodeOptions)
+                ]
+                .spacing(16)
+                .align_y(Alignment::Center),
+                row![
+                    text_input("/path/to/video.mp4", &app.video_path_input)
+                        .on_input(Message::VideoPathInputChanged)
+                        .on_submit(Message::VideoPathLoadPressed)
+                        .width(Length::Fill),
+                    button("Replace From Path").on_press(Message::VideoPathLoadPressed)
+                ]
+                .spacing(10)
                 .width(Length::Fill)
-                .align_x(iced::alignment::Horizontal::Right);
+            ]
+            .spacing(10);
 
             let metadata_sections_row = if video.metadata_markdown_sections.is_empty() {
                 row![text("No video metadata available.")]
@@ -138,7 +194,7 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
             .height(Length::Fill)
             .padding(iced::Padding::new(14.0));
 
-            column![
+            let base = column![
                 container(header)
                     .width(Length::Fill)
                     .padding(iced::Padding::new(12.0).right(14.0).top(8.0)),
@@ -152,8 +208,22 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
             ]
             .spacing(12)
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+
+            if app.supports_file_drop && app.hovered_drop_file.is_some() {
+                let overlay = centered_drop_overlay(
+                    app,
+                    "Drop to replace current video",
+                    "The new file will replace the current review and reset encode/upload state.",
+                );
+
+                stack![base, opaque(overlay)]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                base.into()
+            }
         }
         None => column![text("No video loaded. Select a file to continue.").size(24),]
             .spacing(16)
@@ -162,6 +232,92 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
     };
 
     container(content).width(Length::Fill).height(Length::Fill).into()
+}
+
+fn centered_drop_overlay<'a>(app: &HLSenpai, title: &'a str, subtitle: &'a str) -> El<'a> {
+    let overlay_content = column![
+        text(title).size(28),
+        text(subtitle).size(16),
+        text(drop_hint_text(app, "Drop a supported video file")).size(14)
+    ]
+    .spacing(10)
+    .align_x(Alignment::Center);
+
+    container(
+        container(overlay_content)
+            .padding(iced::Padding::new(24.0))
+            .max_width(620)
+            .style(drop_target_style(true)),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .style(|theme: &iced::Theme| {
+        let mut overlay = theme.extended_palette().background.base.color;
+        overlay.a = 0.72;
+
+        iced::widget::container::Style {
+            background: Some(Background::Color(overlay)),
+            ..iced::widget::container::Style::default()
+        }
+    })
+    .into()
+}
+
+fn drop_target_style(
+    hovered: bool,
+) -> impl Fn(&iced::Theme) -> iced::widget::container::Style + Copy {
+    move |theme: &iced::Theme| {
+        let palette = theme.extended_palette();
+        let background = if hovered {
+            let mut color = palette.primary.strong.color;
+            color.a = 0.18;
+            color
+        } else {
+            let mut color = palette.background.weak.color;
+            color.a = 0.45;
+            color
+        };
+        let border_color = if hovered {
+            palette.primary.strong.color
+        } else {
+            palette.background.strong.color
+        };
+
+        iced::widget::container::Style {
+            background: Some(Background::Color(background)),
+            border: Border {
+                width: if hovered { 2.0 } else { 1.0 },
+                radius: 18.0.into(),
+                color: border_color,
+            },
+            text_color: Some(Color::WHITE),
+            ..iced::widget::container::Style::default()
+        }
+    }
+}
+
+fn drop_hint_text(app: &HLSenpai, fallback: &str) -> String {
+    app.hovered_drop_file
+        .as_deref()
+        .and_then(drop_file_name)
+        .map(|name| format!("Ready to load: {name}"))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn drop_hint_text_for_state(app: &HLSenpai, hovered_hint: String) -> String {
+    if app.supports_file_drop {
+        hovered_hint
+    } else {
+        "Use Select File or paste a file path below".to_string()
+    }
+}
+
+fn drop_file_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
 }
 
 pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {

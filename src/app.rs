@@ -8,7 +8,7 @@ use crate::upload::{UploadOverwriteMode, UploadProgress, UploadTargetKind, Uploa
 use crate::views;
 
 use iced::widget::markdown;
-use iced::{Element, Subscription, Task, Theme};
+use iced::{Element, Event, Subscription, Task, Theme, event, window};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
@@ -597,6 +597,9 @@ pub(crate) struct AwsCredentialsFormState {
 pub(crate) struct HLSenpai {
     pub video: Option<PreviewVideo>,
     pub state: AppState,
+    pub hovered_drop_file: Option<PathBuf>,
+    pub video_path_input: String,
+    pub supports_file_drop: bool,
     pub encode_options: Option<EncodeOptionsForm>,
     pub ffmpeg_script_popup: Option<markdown::Content>,
     pub encode_runtime: Option<EncodeRuntimeState>,
@@ -663,6 +666,9 @@ impl HLSenpai {
         Self {
             video: None,
             state: AppState::Initial,
+            hovered_drop_file: None,
+            video_path_input: String::new(),
+            supports_file_drop: file_drop_supported_in_session(),
             encode_options: None,
             ffmpeg_script_popup: None,
             encode_runtime: None,
@@ -704,6 +710,8 @@ impl HLSenpai {
     }
 
     pub(crate) fn subscription(&self) -> Subscription<Message> {
+        let mut subscriptions = vec![event::listen_with(handle_runtime_event)];
+
         let encode_subscription = if self
             .encode_runtime
             .as_ref()
@@ -724,12 +732,15 @@ impl HLSenpai {
             None
         };
 
-        match (encode_subscription, upload_subscription) {
-            (Some(encode), Some(upload)) => Subscription::batch(vec![encode, upload]),
-            (Some(encode), None) => encode,
-            (None, Some(upload)) => upload,
-            (None, None) => Subscription::none(),
+        if let Some(encode) = encode_subscription {
+            subscriptions.push(encode);
         }
+
+        if let Some(upload) = upload_subscription {
+            subscriptions.push(upload);
+        }
+
+        Subscription::batch(subscriptions)
     }
 
     pub(crate) fn view(&self) -> Element<'_, Message> {
@@ -774,6 +785,25 @@ impl HLSenpai {
             eprintln!("Could not save upload preferences: {}", err);
         }
     }
+}
+
+fn handle_runtime_event(
+    event: Event,
+    _status: event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        Event::Window(window::Event::FileHovered(path)) => Some(Message::WindowFileHovered(path)),
+        Event::Window(window::Event::FileDropped(path)) => Some(Message::WindowFileDropped(path)),
+        Event::Window(window::Event::FilesHoveredLeft) => Some(Message::WindowFilesHoveredLeft),
+        _ => None,
+    }
+}
+
+fn file_drop_supported_in_session() -> bool {
+    !std::env::var("XDG_SESSION_TYPE")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
 }
 
 pub(crate) fn non_empty(value: &str) -> Option<String> {

@@ -26,6 +26,11 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     SelectFilePressed,
+    WindowFileHovered(PathBuf),
+    WindowFileDropped(PathBuf),
+    WindowFilesHoveredLeft,
+    VideoPathInputChanged(String),
+    VideoPathLoadPressed,
     OpenEncodeOptions,
     BackToVideoOverview,
     TogglePause,
@@ -91,13 +96,7 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
 
     match message {
         Message::SelectFilePressed => {
-            app.ffmpeg_script_popup = None;
-            app.encode_runtime = None;
-            app.upload_runtime = None;
-            app.show_encode_log_modal = false;
-            app.show_upload_modal = false;
-            app.show_upload_credentials_modal = false;
-            app.last_encode_output_root = None;
+            app.hovered_drop_file = None;
 
             let selection = rfd::FileDialog::new()
                 .set_title("Select a video file")
@@ -107,107 +106,45 @@ pub(crate) fn handle_messages(app: &mut HLSenpai, message: Message) -> Task<Mess
                 )
                 .pick_file();
 
-            app.video = match selection {
-                Some(path) => match validate_video_file(&path) {
-                    Ok(()) => {
-                        let metadata = match extract_video_metadata(&path) {
-                            Ok(metadata) => metadata,
-                            Err(reason) => {
-                                let err_msg = format!(
-                                    "Could not read video metadata:\n{}\nReason: {}",
-                                    path.display(),
-                                    reason
-                                );
-                                let _ = rfd::MessageDialog::new()
-                                    .set_title("Metadata Read Failed")
-                                    .set_description(&err_msg)
-                                    .set_buttons(rfd::MessageButtons::Ok)
-                                    .show();
-                                eprintln!("{err_msg}");
-                                app.state = AppState::Initial;
-                                return Task::none();
-                            }
-                        };
-                        let metadata_markdown_sections =
-                            video_metadata_markdown_sections(&metadata)
-                                .into_iter()
-                                .map(|section| markdown::Content::parse(&section))
-                                .collect::<Vec<_>>();
-
-                        let video_url = match url::Url::from_file_path(&path) {
-                            Ok(url) => url,
-                            Err(()) => {
-                                let err_msg = format!(
-                                    "Could not convert file path to URL:\n{}",
-                                    path.display()
-                                );
-                                let _ = rfd::MessageDialog::new()
-                                    .set_title("File Path Error")
-                                    .set_description(&err_msg)
-                                    .set_buttons(rfd::MessageButtons::Ok)
-                                    .show();
-                                eprintln!("{err_msg}");
-                                app.state = AppState::Initial;
-                                return Task::none();
-                            }
-                        };
-
-                        match Video::new(&video_url) {
-                            Ok(video) => {
-                                println!("Selected file: {}", path.display());
-                                app.state = AppState::VideoOverview;
-                                app.encode_options = None;
-                                Some(PreviewVideo {
-                                    video,
-                                    _path: path,
-                                    metadata,
-                                    metadata_markdown_sections,
-                                    position: 0.0,
-                                    dragging: false,
-                                })
-                            }
-                            Err(err) => {
-                                let err_msg = format!(
-                                    "Could not load selected video:\n{}\nReason: {}",
-                                    path.display(),
-                                    err
-                                );
-                                let _ = rfd::MessageDialog::new()
-                                    .set_title("Video Load Failed")
-                                    .set_description(&err_msg)
-                                    .set_buttons(rfd::MessageButtons::Ok)
-                                    .show();
-                                eprintln!("{err_msg}");
-                                app.state = AppState::Initial;
-                                app.encode_options = None;
-                                None
-                            }
-                        }
-                    }
-                    Err(reason) => {
-                        let err_msg = format!(
-                            "Selected file is not a valid supported video:\n{}\nReason: {}",
-                            path.display(),
-                            reason
-                        );
-                        let _ = rfd::MessageDialog::new()
-                            .set_title("Format Not Supported")
-                            .set_description(&err_msg)
-                            .set_buttons(rfd::MessageButtons::Ok)
-                            .show();
-                        eprintln!("{err_msg}");
-                        app.state = AppState::Initial;
-                        app.encode_options = None;
-                        None
-                    }
-                },
+            match selection {
+                Some(path) => {
+                    load_video_into_app(app, path);
+                }
                 None => {
                     eprintln!("File selection cancelled");
                     app.state = AppState::Initial;
                     app.encode_options = None;
-                    None
                 }
-            };
+            }
+        }
+        Message::VideoPathInputChanged(value) => {
+            app.video_path_input = value;
+        }
+        Message::VideoPathLoadPressed => {
+            let trimmed = app.video_path_input.trim();
+            if trimmed.is_empty() {
+                eprintln!("Cannot load video: file path is empty.");
+                return Task::none();
+            }
+
+            if load_video_into_app(app, PathBuf::from(trimmed)) {
+                app.video_path_input.clear();
+            }
+        }
+        Message::WindowFileHovered(path) => {
+            if accepts_video_drop(app) {
+                app.hovered_drop_file = Some(path);
+            }
+        }
+        Message::WindowFileDropped(path) => {
+            app.hovered_drop_file = None;
+
+            if accepts_video_drop(app) {
+                let _ = load_video_into_app(app, path);
+            }
+        }
+        Message::WindowFilesHoveredLeft => {
+            app.hovered_drop_file = None;
         }
         Message::OpenEncodeOptions => {
             if let Some(video) = app.video.as_ref() {
@@ -933,6 +870,124 @@ fn apply_upload_worker_event(runtime: &mut UploadRuntimeState, event: UploadWork
     }
 
     log_changed
+}
+
+fn accepts_video_drop(app: &HLSenpai) -> bool {
+    matches!(app.state, AppState::Initial | AppState::VideoOverview)
+}
+
+fn load_video_into_app(app: &mut HLSenpai, path: PathBuf) -> bool {
+    match preview_video_from_path(&path) {
+        Ok(preview_video) => {
+            println!("Loaded file: {}", path.display());
+            reset_state_for_new_video(app);
+            app.video = Some(preview_video);
+            app.state = AppState::VideoOverview;
+            app.encode_options = None;
+            true
+        }
+        Err(VideoLoadError::Validation(reason)) => {
+            let err_msg = format!(
+                "Selected file is not a valid supported video:\n{}\nReason: {}",
+                path.display(),
+                reason
+            );
+            show_file_error("Format Not Supported", &err_msg);
+
+            if app.video.is_none() {
+                app.state = AppState::Initial;
+                app.encode_options = None;
+            }
+            false
+        }
+        Err(VideoLoadError::Metadata(reason)) => {
+            let err_msg = format!(
+                "Could not read video metadata:\n{}\nReason: {}",
+                path.display(),
+                reason
+            );
+            show_file_error("Metadata Read Failed", &err_msg);
+
+            if app.video.is_none() {
+                app.state = AppState::Initial;
+                app.encode_options = None;
+            }
+            false
+        }
+        Err(VideoLoadError::PathUrl) => {
+            let err_msg = format!("Could not convert file path to URL:\n{}", path.display());
+            show_file_error("File Path Error", &err_msg);
+
+            if app.video.is_none() {
+                app.state = AppState::Initial;
+                app.encode_options = None;
+            }
+            false
+        }
+        Err(VideoLoadError::VideoLoad(reason)) => {
+            let err_msg = format!(
+                "Could not load selected video:\n{}\nReason: {}",
+                path.display(),
+                reason
+            );
+            show_file_error("Video Load Failed", &err_msg);
+
+            if app.video.is_none() {
+                app.state = AppState::Initial;
+                app.encode_options = None;
+            }
+            false
+        }
+    }
+}
+
+fn reset_state_for_new_video(app: &mut HLSenpai) {
+    app.hovered_drop_file = None;
+    app.ffmpeg_script_popup = None;
+    app.encode_runtime = None;
+    app.upload_runtime = None;
+    app.show_encode_log_modal = false;
+    app.show_upload_modal = false;
+    app.show_upload_credentials_modal = false;
+    app.last_encode_output_root = None;
+}
+
+fn show_file_error(title: &str, description: &str) {
+    let _ = rfd::MessageDialog::new()
+        .set_title(title)
+        .set_description(description)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    eprintln!("{description}");
+}
+
+fn preview_video_from_path(path: &Path) -> Result<PreviewVideo, VideoLoadError> {
+    validate_video_file(path).map_err(VideoLoadError::Validation)?;
+
+    let metadata = extract_video_metadata(path).map_err(VideoLoadError::Metadata)?;
+    let metadata_markdown_sections = video_metadata_markdown_sections(&metadata)
+        .into_iter()
+        .map(|section| markdown::Content::parse(&section))
+        .collect::<Vec<_>>();
+
+    let video_url = url::Url::from_file_path(path).map_err(|()| VideoLoadError::PathUrl)?;
+    let video = Video::new(&video_url).map_err(|err| VideoLoadError::VideoLoad(err.to_string()))?;
+
+    Ok(PreviewVideo {
+        video,
+        _path: path.to_path_buf(),
+        metadata,
+        metadata_markdown_sections,
+        position: 0.0,
+        dragging: false,
+    })
+}
+
+enum VideoLoadError {
+    Validation(String),
+    Metadata(String),
+    PathUrl,
+    VideoLoad(String),
 }
 
 fn encode_is_success(app: &HLSenpai) -> bool {
