@@ -14,15 +14,25 @@ use std::time::Duration;
 type El<'a> = Element<'a, Message>;
 
 pub(crate) fn select_file(_app: &HLSenpai) -> El<'_> {
-    let content = column![button("Select File").on_press(Message::SelectFilePressed),]
-        .spacing(16)
-        .align_x(Alignment::Center);
+    let content = column![
+        container(
+            column![button("Select File").on_press(Message::SelectFilePressed),]
+                .spacing(16)
+                .align_x(Alignment::Center)
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill),
+        bottom_breadcrumbs(BreadcrumbStep::SelectSource)
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .spacing(16);
 
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
         .into()
 }
 
@@ -137,7 +147,8 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
                     .height(Length::FillPortion(3)),
                 container(metadata_panel)
                     .width(Length::Fill)
-                    .height(Length::FillPortion(2))
+                    .height(Length::FillPortion(2)),
+                bottom_breadcrumbs(BreadcrumbStep::Review)
             ]
             .spacing(12)
             .width(Length::Fill)
@@ -150,12 +161,7 @@ pub(crate) fn video_overview(app: &HLSenpai) -> El<'_> {
             .into(),
     };
 
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
+    container(content).width(Length::Fill).height(Length::Fill).into()
 }
 
 pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
@@ -521,6 +527,7 @@ pub(crate) fn encode_options(app: &HLSenpai) -> El<'_> {
                 )
                 .height(Length::Fill)
                 .width(Length::Fill),
+                bottom_breadcrumbs(BreadcrumbStep::Encode)
             ]
             .spacing(16)
             .width(Length::Fill)
@@ -975,6 +982,77 @@ fn format_duration(duration: Duration) -> String {
         format!("{hours:02}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreadcrumbStep {
+    SelectSource,
+    Review,
+    Encode,
+}
+
+fn bottom_breadcrumbs(current: BreadcrumbStep) -> El<'static> {
+    let steps = [
+        (
+            BreadcrumbStep::SelectSource,
+            "Select Source",
+            Some(Message::SelectFilePressed),
+        ),
+        (
+            BreadcrumbStep::Review,
+            "Review",
+            Some(Message::BackToVideoOverview),
+        ),
+        (BreadcrumbStep::Encode, "Encode", None),
+    ];
+
+    let row = steps
+        .into_iter()
+        .enumerate()
+        .fold(row![].spacing(10).align_y(Alignment::Center), |row, (index, step)| {
+            let (kind, label, message) = step;
+            let row = if index > 0 {
+                row.push(text(">").size(16))
+            } else {
+                row
+            };
+
+            let item: El<'static> = if kind == current {
+                text(label).size(16).into()
+            } else if is_step_enabled(current, kind) {
+                if let Some(message) = message {
+                    button(text(label).size(16))
+                        .style(iced::widget::button::text)
+                        .on_press(message)
+                        .into()
+                } else {
+                    text(label).size(16).into()
+                }
+            } else {
+                text(label).size(16).into()
+            };
+
+            row.push(item)
+        });
+
+    container(row)
+        .width(Length::Fill)
+        .padding(iced::Padding::new(12.0))
+        .center_x(Length::Fill)
+        .style(iced::widget::container::rounded_box)
+        .into()
+}
+
+fn is_step_enabled(current: BreadcrumbStep, target: BreadcrumbStep) -> bool {
+    step_index(target) < step_index(current)
+}
+
+fn step_index(step: BreadcrumbStep) -> usize {
+    match step {
+        BreadcrumbStep::SelectSource => 0,
+        BreadcrumbStep::Review => 1,
+        BreadcrumbStep::Encode => 2,
     }
 }
 
